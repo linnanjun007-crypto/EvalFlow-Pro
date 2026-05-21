@@ -1,0 +1,34 @@
+:root {
+  /* EvalFlow Pro（默认）：全白工作台 + 蓝色强调 */
+  --ef-bg: #ffffff;
+  --ef-text: #111827;
+  --ef-text-2: rgba(17, 24, 39, 0.68);
+  --ef-border: rgba(15, 23, 42, 0.1);
+  --ef-accent: #2563eb;
+  --ef-accent-muted: rgba(37, 99, 235, 0.16);
+  --ef-surface: #ffffff;
+  --ef-surface-2: #f8fafc;
+  --ef-page-max: 1180px;
+  --ef-page-pad: 20px;
+  --ef-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --ef-font-heading: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --ef-script: 'Condiment', cursive;
+  --ef-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+}
+
+/* 官网首页：Warm Sand & Zen */
+body.orbis-route {
+  --ef-bg: #f5f2ed;
+  --ef-text: #1a1a1a;
+  --ef-text-2: #6b7280;
+  --ef-border: rgba(26, 26, 26, 0.08);
+  --ef-accent: #2d3e35;
+  --ef-accent-muted: rgba(45, 62, 53, 0.12);
+  --ef-surface: #ffffff;
+  --ef-surface-2: #f5f2ed;
+  --ef-page-max: 1280px;
+  --ef-font: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --ef-font-heading: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --ef-script: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
