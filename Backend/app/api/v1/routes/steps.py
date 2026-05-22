@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
@@ -13,6 +18,17 @@ def get_step_service(db: Session = Depends(get_db)) -> StepService:
     return StepService(db)
 
 
+def _serialize_content_json(value: Any) -> str:
+    if value is None:
+        return "{}"
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
+
+
 @router.post("/{step_code}/generate", response_model=StepGenerateResponse)
 def generate_step(
     step_code: str,
@@ -20,11 +36,15 @@ def generate_step(
     service: StepService = Depends(get_step_service),
 ) -> dict[str, str | None]:
     try:
+        merged_payload = (payload.payload or {}) | {
+            "review_mode": payload.review_mode,
+            "review_feedback": payload.review_feedback,
+        }
         result = service.generate_step(
             project_id=payload.project_id,
             step_code=step_code,
             role=payload.workflow_role,
-            payload=payload.payload | {"review_mode": payload.review_mode, "review_feedback": payload.review_feedback},
+            payload=merged_payload,
             context={"project_id": payload.project_id, "workflow_role": payload.workflow_role},
         )
         return {
@@ -50,7 +70,7 @@ def get_step_result(step_code: str, project_id: str, service: StepService = Depe
 @router.post("/{step_code}/save")
 def save_step_result(
     step_code: str,
-    payload: dict[str, object] = Body(...),
+    payload: dict[str, Any] = Body(...),
     service: StepService = Depends(get_step_service),
 ) -> dict[str, object]:
     try:
@@ -59,7 +79,7 @@ def save_step_result(
             step_code=step_code,
             title=str(payload.get("title") or f"{step_code} 输出"),
             content_text=str(payload.get("content_text") or ""),
-            content_json=str(payload.get("content_json") or "{}"),
+            content_json=_serialize_content_json(payload.get("content_json")),
             model_name=str(payload.get("model_name") or "manual-edit"),
         )
     except ValueError as exc:

@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -7,7 +9,7 @@ class StepGenerateRequest(BaseModel):
     review_feedback: str | None = None
     workflow_role: str = "user"
     step_code: str | None = None
-    payload: dict[str, object] = Field(default_factory=dict)
+    payload: dict[str, Any] | None = None
 
 
 class StepGenerateResponse(BaseModel):
@@ -21,4 +23,4 @@ class StepResultResponse(BaseModel):
     project_id: str
     step_code: str
     status: str
-    result: dict[str, object]
+    result: dict[str, Any]

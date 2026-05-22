@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import zipfile
@@ -10,8 +11,11 @@ from urllib.parse import quote
 from uuid import uuid4
 from xml.sax.saxutils import escape
 
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.db.session import SessionLocal
@@ -496,4 +500,197 @@ def download_export(project_id: str, filename: str) -> FileResponse:
         path=export_path,
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         headers={'Content-Disposition': _attachment_disposition(display_name)},
+    )
+
+
+STEP_TITLE_MAP: dict[str, str] = {
+    'step1': '项目资料清单',
+    'step2': '有效项目资料',
+    'step3': '指标体系',
+    'step4': '生成分值',
+    'step5': '评分标准',
+    'step14': '评价报告',
+}
+
+
+class GenericStepExportRequest(BaseModel):
+    project_name: str = Field(default='')
+    content_text: str = Field(default='', min_length=1)
+    export_style: str = Field(default='classic')
+    custom_title: str | None = None
+    user_id: str = Field(default='demo-user-id')
+    project_id: str | None = None
+    save_to_database: bool = Field(default=True)
+
+
+def _step_default_title(step_code: str) -> str:
+    if step_code in STEP_TITLE_MAP:
+        return f'{step_code.capitalize()} · {STEP_TITLE_MAP[step_code]}'
+    digits = ''.join(ch for ch in step_code if ch.isdigit())
+    return f'Step{digits or step_code} · 阶段成果' if digits else f'{step_code} · 阶段成果'
+
+
+def _build_generic_docx(
+    *,
+    title: str,
+    content: str,
+    export_style: str,
+    project_name: str,
+    step_code: str,
+) -> bytes:
+    doc = Document()
+
+    is_classic = export_style == 'classic'
+    body_size = 12 if is_classic else 11
+    heading_size = 18 if is_classic else 16
+
+    normal = doc.styles['Normal']
+    normal.font.name = 'SimSun' if is_classic else 'Microsoft YaHei'
+    normal.font.size = Pt(body_size)
+
+    cover_title = doc.add_paragraph()
+    cover_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = cover_title.add_run(title)
+    title_run.bold = True
+    title_run.font.size = Pt(heading_size + 6)
+
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_run = subtitle.add_run(f'{STEP_TITLE_MAP.get(step_code, "阶段成果")}成果文件')
+    subtitle_run.italic = True
+    subtitle_run.font.size = Pt(body_size + 2)
+
+    now_text = datetime.now().strftime('%Y年%m月%d日')
+    timestamp_para = doc.add_paragraph()
+    timestamp_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    timestamp_para.add_run(now_text)
+
+    info_table = doc.add_table(rows=4, cols=2)
+    info_table.style = 'Light Grid Accent 1' if 'Light Grid Accent 1' in [s.name for s in doc.styles] else 'Table Grid'
+    rows_data = [
+        ('项目名称', project_name),
+        ('阶段编号', step_code),
+        ('排版样式', '经典排版' if is_classic else '自定义排版'),
+        ('导出时间', now_text),
+    ]
+    for row_idx, (key, value) in enumerate(rows_data):
+        info_table.rows[row_idx].cells[0].text = key
+        info_table.rows[row_idx].cells[1].text = value
+
+    doc.add_paragraph()
+    section_heading = doc.add_heading(f'一、{STEP_TITLE_MAP.get(step_code, "阶段成果")}正文', level=1)
+    for run in section_heading.runs:
+        run.font.size = Pt(heading_size)
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            doc.add_paragraph()
+            continue
+        if stripped.startswith('### '):
+            heading = doc.add_heading(stripped[4:].strip(), level=3)
+            for run in heading.runs:
+                run.font.size = Pt(max(body_size + 2, heading_size - 4))
+            continue
+        if stripped.startswith('## '):
+            heading = doc.add_heading(stripped[3:].strip(), level=2)
+            for run in heading.runs:
+                run.font.size = Pt(max(body_size + 4, heading_size - 2))
+            continue
+        if stripped.startswith('# '):
+            heading = doc.add_heading(stripped[2:].strip(), level=1)
+            for run in heading.runs:
+                run.font.size = Pt(heading_size)
+            continue
+        if re.match(r'^(一|二|三|四|五|六|七|八|九|十)[、.]', stripped):
+            heading = doc.add_heading(stripped, level=1)
+            for run in heading.runs:
+                run.font.size = Pt(heading_size)
+            continue
+        if re.match(r'^（[一二三四五六七八九十]+）', stripped) or re.match(r'^\d+[.、]', stripped):
+            heading = doc.add_heading(stripped, level=2)
+            for run in heading.runs:
+                run.font.size = Pt(max(body_size + 2, heading_size - 4))
+            continue
+        if stripped.startswith(('- ', '• ', '* ')):
+            bullet = doc.add_paragraph(stripped.lstrip('-•* '), style='List Bullet')
+            for run in bullet.runs:
+                run.font.size = Pt(body_size)
+            continue
+        para = doc.add_paragraph(stripped)
+        for run in para.runs:
+            run.font.size = Pt(body_size)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+@router.post('/{step_code}/word')
+def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(...)) -> StreamingResponse:
+    code = step_code.lower().strip()
+    if not re.match(r'^step([3-9]|1[0-4])$', code):
+        raise HTTPException(status_code=400, detail='step_code 必须是 step3~step14（step1/step2 请使用专用导出接口）')
+
+    content = payload.content_text.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail='content_text is required')
+    placeholder_values = {'最终版本内容将在这里编辑。', '最后版本内容将在这里编辑。'}
+    if content in placeholder_values or len(content) < 10:
+        raise HTTPException(status_code=400, detail='当前成品内容为空或仍为占位文本，请先生成 / 编辑后再导出')
+
+    project_name = payload.project_name.strip() or '未命名项目'
+    style = payload.export_style if payload.export_style in {'classic', 'custom'} else 'classic'
+    title = (
+        payload.custom_title.strip()
+        if payload.custom_title and payload.custom_title.strip()
+        else _step_default_title(code)
+    )
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'{_safe_filename(project_name)}_{code}_{timestamp}.docx'
+
+    docx_bytes = _build_generic_docx(
+        title=title,
+        content=content,
+        export_style=style,
+        project_name=project_name,
+        step_code=code,
+    )
+
+    project_id = (payload.project_id or '').strip()
+    if payload.save_to_database and project_id:
+        export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
+        export_dir.mkdir(parents=True, exist_ok=True)
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        export_path.write_bytes(docx_bytes)
+
+        metadata = {
+            'project_id': project_id,
+            'project_name': project_name,
+            'step_code': code,
+            'content_text': content,
+            'export_style': style,
+            'export_filename': filename,
+            'storage_key': str(export_path),
+            'exported_at': datetime.utcnow().isoformat(),
+        }
+        with SessionLocal() as db:
+            FileService(db).create_file_record(
+                project_id=project_id,
+                user_id=payload.user_id,
+                project_name=project_name,
+                file_name=filename,
+                file_type='docx',
+                storage_key=str(export_path),
+                source_type=f'{code}_export_final',
+                file_size=len(docx_bytes),
+                metadata_json=json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return StreamingResponse(
+        io.BytesIO(docx_bytes),
+        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        headers={'Content-Disposition': _attachment_disposition(filename)},
     )

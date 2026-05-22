@@ -201,13 +201,14 @@ async def run_agent(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     project_id = str(body.get('project_id') or context.get('project_id') or '')
     user_id = str(body.get('user_id') or context.get('user_id') or 'demo-user-id')
     memory_scope = str(context.get('memory_scope') or 'short_term')
-    thread_id = str(context.get('thread_id') or body.get('thread_id') or f'{project_id}:{step_code}')
 
     is_admin_workflow = role in {'admin', 'manager', 'admin_graphs'}
     if not project_id and not is_admin_workflow:
         raise HTTPException(status_code=400, detail='project_id is required')
     if not project_id:
         project_id = f'admin-{step_code}'
+
+    thread_id = str(context.get('thread_id') or body.get('thread_id') or f'{step_code}:{project_id}')
 
     with SessionLocal() as db:
         if role in {'client', 'user', 'client_graphs'}:
@@ -263,10 +264,9 @@ async def run_agent(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     body.setdefault('project_name', body.get('project_name') or f'项目 {project_id}')
     body.setdefault('session_id', session_id)
     body.setdefault('thread_id', thread_id)
-    body.setdefault('run_id', str(uuid4()))
-    body.setdefault('memory_scope', memory_scope)
-    run_id = str(body.get('run_id') or uuid4())
+    run_id = str(context.get('run_id') or body.get('run_id') or uuid4())
     body['run_id'] = run_id
+    body.setdefault('memory_scope', memory_scope)
     cancel_event = Event()
     ACTIVE_RUNS[run_id] = cancel_event
 

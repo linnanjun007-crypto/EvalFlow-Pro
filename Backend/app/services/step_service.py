@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,13 @@ from app.models.step_history import StepHistory
 from app.models.step_output import StepOutput
 from app.models.task_job import TaskJob
 from app.services.memory_service import MemoryService
+
+
+def _dumps_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
 
 
 class StepService:
@@ -32,6 +40,7 @@ class StepService:
 
         result = self.runner.run(role=role, step_code=step_code, payload=payload, context=context)
         content_text = self._extract_text(result)
+        content_json = _dumps_json(result)
 
         memory = MemoryService(self.db)
         session = memory.ensure_session(project_id=project_id, user_id=payload.get('user_id') if isinstance(payload.get('user_id'), str) else None, step_code=step_code, memory_scope='short_term')
@@ -50,7 +59,7 @@ class StepService:
             project_id=project_id,
             step_code=step_code,
             title=f"{step_code} 输出",
-            content_json=str(result),
+            content_json=content_json,
             content_text=content_text,
             version=1,
             is_final=True,
@@ -63,7 +72,7 @@ class StepService:
             step_output_id=step_output.id,
             model_name=self._extract_model_name(result, context),
             prompt_version_id=None,
-            content_json=str(result),
+            content_json=content_json,
             content_text=content_text,
         )
         self.db.add(step_history)

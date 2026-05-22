@@ -7,3 +7,4 @@ python-dotenv
 langgraph
 httpx
 python-multipart
+python-docx
