@@ -128,6 +128,19 @@ function triggerBrowserDownload(blob: Blob, fileName: string) {
   }, 2000)
 }
 
+export interface Step14ExportRequest {
+  project_name: string
+  content_text: string
+  custom_title?: string | null
+}
+
+export type Step14ExportResponse = Step1ExportResponse
+
+export async function exportStep14Word(projectId: string, payload: Step14ExportRequest) {
+  const { data } = await api.post<Step14ExportResponse>(`/exports/step14/${projectId}`, payload)
+  return data
+}
+
 export async function downloadExportFile(downloadUrl: string, fileName: string) {
   const path = toExportDownloadPath(downloadUrl)
   const response = await api.get(path, {

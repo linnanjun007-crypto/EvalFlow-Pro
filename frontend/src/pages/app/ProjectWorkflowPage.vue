@@ -12,7 +12,7 @@ import ChatDrawer from '../../components/ef/ChatDrawer.vue'
 import TaskProgress from '../../components/ef/TaskProgress.vue'
 import { ElMessage } from 'element-plus'
 import { cancelAgentRun, runAgent, type AgentRunResponse } from '../../services/agent'
-import { downloadExportFile, exportStep1, exportStep2, type Step2FormatOptions } from '../../services/exports'
+import { downloadExportFile, exportStep1, exportStep2, exportStep14Word, type Step2FormatOptions } from '../../services/exports'
 import { createFileRecord, deleteFile, isInputProjectFile, listFiles, uploadProjectFile, type FileRecord } from '../../services/files'
 import { deleteStepHistory, getStepResult, getWorkflowStatus, listStepHistories, saveStepResult, type WorkflowStatusResponse } from '../../services/steps'
 
@@ -244,6 +244,25 @@ const step3SkeletonAddL1DialogVisible = ref(false)
 const step3SkeletonAddL2DialogVisible = ref(false)
 const step3NewL1Name = ref('')
 const step3NewL2Form = ref({ level1_name: '', level2_name: '', target_l3_count: 3 })
+
+interface Step4ScoreItem {
+  level1_name: string
+  level2_name: string
+  level3_name?: string
+  weight?: number
+  score?: number
+}
+const step4FlatL2Tasks = ref<Step4ScoreItem[]>([])
+const step4ScoringMode = ref<'ai' | 'manual'>('ai')
+const step4ManualScores = ref<Record<string, number>>({})
+const step4ValidationErrors = ref<string[]>([])
+const step4TotalScore = ref(100)
+const step5ScoreSheet = ref('')
+const step9StyleMode = ref<'neutral' | 'sharp' | 'gentle'>('neutral')
+const step14ExportSaving = ref(false)
+const step14ExportCustomTitle = ref('')
+const prevStepContent = ref('')
+
 const workflowStatus = ref<WorkflowStatusResponse | null>(null)
 type ClientModelConfig = {
   id: string
@@ -366,6 +385,8 @@ const canGenerate = computed(() => {
     const step2Core = step3State.value?.final_core_content ?? step3State.value?.content_text ?? step3State.value?.core_content_draft
     return typeof step2Core === 'string' && step2Core.trim().length > 0
   }
+  if (stepId.value === 4) return step4FlatL2Tasks.value.length > 0
+  if (stepId.value >= 5 && stepId.value <= 14) return prevStepContent.value.trim().length > 0 || editor.value.trim().length > 0
   return inputProjectFiles.value.length > 0
 })
 const mediaFiles = computed(() => inputProjectFiles.value.filter((item) => isMediaFile(item.file_type, item.file_name)))
@@ -385,6 +406,14 @@ const titleMap: Record<number, string> = {
   3: 'Step3 · 指标体系',
   4: 'Step4 · 生成分值',
   5: 'Step5 · 评分标准',
+  6: 'Step6 · 现场评价表',
+  7: 'Step7 · 得分与分析',
+  8: 'Step8 · 经验做法',
+  9: 'Step9 · 问题及原因',
+  10: 'Step10 · 整改建议',
+  11: 'Step11 · 综合分析',
+  12: 'Step12 · 基础信息',
+  13: 'Step13 · 工作情况',
   14: 'Step14 · 评价报告',
 }
 
@@ -860,14 +889,46 @@ async function loadResult() {
       // step2 not generated yet
     }
   } else if (stepId.value !== 1) {
+    if (stepId.value === 4) {
+      try {
+        const step3Res = await getStepResult('step3', projectId.value)
+        const step3Result = (step3Res.result as Record<string, unknown>) || null
+        if (step3Result) {
+          const tasks = step3Result.flat_l2_tasks
+          if (Array.isArray(tasks)) {
+            step4FlatL2Tasks.value = tasks.map((t: any) => ({
+              level1_name: String(t.level1_name || ''),
+              level2_name: String(t.level2_name || ''),
+              level3_name: t.level3_name ? String(t.level3_name) : undefined,
+              weight: typeof t.weight === 'number' ? t.weight : undefined,
+              score: undefined,
+            }))
+          }
+        }
+      } catch {
+        step4FlatL2Tasks.value = []
+      }
+    } else if (stepId.value >= 5 && stepId.value <= 14) {
+      try {
+        const prevCode = `step${stepId.value - 1}`
+        const prevRes = await getStepResult(prevCode, projectId.value)
+        const prevResult = (prevRes.result as Record<string, unknown>) || null
+        if (prevResult) {
+          const text = prevResult.content_text || prevResult.final_core_content || prevResult.final_indicator_markdown || ''
+          prevStepContent.value = typeof text === 'string' ? text : ''
+        }
+      } catch {
+        prevStepContent.value = ''
+      }
+    }
     try {
       const res = await getStepResult(stepCodeOf(), projectId.value)
       const saved = (res.result as Record<string, unknown>) || null
       if (saved) {
         currentResult.value = saved
         resultText.value = JSON.stringify(saved, null, 2)
-        const text = readStep3FinishText(saved)
-        if (text.trim()) editor.value = text
+        const text = (saved.content_text as string) || readStep3FinishText(saved)
+        if (typeof text === 'string' && text.trim()) editor.value = text
       }
     } catch {
       // no saved result for this step yet
@@ -1142,6 +1203,29 @@ function applyAgentResult(res: AgentRunResponse) {
     extractStep2State(currentResult.value, comparisons)
   }
 
+  if (stepId.value === 4 && currentResult.value) {
+    const tasks = currentResult.value['flat_l2_tasks']
+    if (Array.isArray(tasks)) {
+      step4FlatL2Tasks.value = tasks.map((t: any) => ({
+        level1_name: String(t.level1_name || ''),
+        level2_name: String(t.level2_name || ''),
+        level3_name: t.level3_name ? String(t.level3_name) : undefined,
+        weight: typeof t.weight === 'number' ? t.weight : undefined,
+        score: typeof t.score === 'number' ? t.score : undefined,
+      }))
+      const scores: Record<string, number> = {}
+      for (const t of step4FlatL2Tasks.value) {
+        if (t.score !== undefined) {
+          scores[`${t.level1_name}|${t.level2_name}`] = t.score
+        }
+      }
+      if (Object.keys(scores).length > 0) step4ManualScores.value = scores
+    }
+    if (typeof currentResult.value['total_score'] === 'number') {
+      step4TotalScore.value = currentResult.value['total_score'] as number
+    }
+  }
+
   const structuredSummaries = [
     {
       title: '指标骨架',
@@ -1253,7 +1337,14 @@ async function saveCurrentStep() {
               skeleton_optimize_mode: step3Config.value.skeleton_optimize_mode,
               per_optimize_level2_name: step3Config.value.per_optimize_level2_name,
             }, null, 2)
-          : resultText.value || '{}'
+          : stepId.value === 4
+            ? JSON.stringify({
+                flat_l2_tasks: step4FlatL2Tasks.value,
+                scoring_mode: step4ScoringMode.value,
+                manual_scores: step4ManualScores.value,
+                total_score: step4TotalScore.value,
+              }, null, 2)
+            : resultText.value || '{}'
         const saved = await saveStepResult(stepCodeOf(), {
           project_id: projectId.value,
           title: titleMap[stepId.value] ?? `Step ${stepId.value} 输出`,
@@ -1467,11 +1558,104 @@ function buildGenericAgentPayload() {
   }
 }
 
+function buildStep4AgentPayload() {
+  const base = buildGenericAgentPayload()
+  return {
+    ...base,
+    flat_l2_tasks: step4FlatL2Tasks.value,
+    scoring_mode: step4ScoringMode.value,
+    manual_scores: step4ScoringMode.value === 'manual' ? step4ManualScores.value : {},
+    total_score: step4TotalScore.value,
+  }
+}
+
+function buildStep5AgentPayload() {
+  const base = buildGenericAgentPayload()
+  return {
+    ...base,
+    score_sheet: step5ScoreSheet.value,
+    content_text: prevStepContent.value || editor.value,
+  }
+}
+
+function buildStep9AgentPayload() {
+  const base = buildGenericAgentPayload()
+  return {
+    ...base,
+    style_mode: step9StyleMode.value,
+    content_text: prevStepContent.value || editor.value,
+  }
+}
+
+function buildStep14AgentPayload() {
+  const base = buildGenericAgentPayload()
+  return {
+    ...base,
+    content_text: prevStepContent.value || editor.value,
+    custom_title: step14ExportCustomTitle.value || null,
+  }
+}
+
 function buildAgentPayloadByStep() {
   if (stepId.value === 1) return buildStep1AgentPayload()
   if (stepId.value === 2) return buildStep2AgentPayload()
   if (stepId.value === 3) return buildStep3AgentPayload()
+  if (stepId.value === 4) return buildStep4AgentPayload()
+  if (stepId.value === 5) return buildStep5AgentPayload()
+  if (stepId.value === 9) return buildStep9AgentPayload()
+  if (stepId.value === 14) return buildStep14AgentPayload()
+  if (stepId.value >= 6 && stepId.value <= 13) {
+    const base = buildGenericAgentPayload()
+    return { ...base, content_text: prevStepContent.value || editor.value }
+  }
   return buildGenericAgentPayload()
+}
+
+function validateStep4Scores(): { errors: string[]; warnings: string[] } {
+  const errors: string[] = []
+  const warnings: string[] = []
+  const items = step4FlatL2Tasks.value
+  const scores = step4ManualScores.value
+
+  if (step4ScoringMode.value === 'manual') {
+    let total = 0
+    for (const item of items) {
+      const key = `${item.level1_name}|${item.level2_name}`
+      const score = scores[key] ?? item.score ?? 0
+      if (score < 0 || score > 100) {
+        errors.push(`「${item.level2_name}」分值 ${score} 超出 [0, 100] 范围`)
+      }
+      total += score
+    }
+    if (Math.abs(total - step4TotalScore.value) > 0.01) {
+      errors.push(`各项分值之和 ${total.toFixed(2)} ≠ 总分 ${step4TotalScore.value}`)
+    }
+
+    const l1Groups: Record<string, number[]> = {}
+    for (const item of items) {
+      const key = `${item.level1_name}|${item.level2_name}`
+      const score = scores[key] ?? item.score ?? 0
+      if (!l1Groups[item.level1_name]) l1Groups[item.level1_name] = []
+      l1Groups[item.level1_name].push(score)
+    }
+    for (const [l1, childScores] of Object.entries(l1Groups)) {
+      const childSum = childScores.reduce((a, b) => a + b, 0)
+      const parentWeight = items.find((i) => i.level1_name === l1)?.weight
+      if (parentWeight !== undefined && Math.abs(childSum - parentWeight) > 0.01) {
+        errors.push(`一级「${l1}」子项合计 ${childSum.toFixed(2)} ≠ 父级权重 ${parentWeight}`)
+      }
+    }
+
+    const hasOutputBenefit = items.some(
+      (i) => /产出|效益/.test(i.level1_name) || /产出|效益/.test(i.level2_name || '')
+    )
+    if (!hasOutputBenefit) {
+      warnings.push('指标体系中未包含「产出」或「效益」相关指标，建议检查')
+    }
+  }
+
+  step4ValidationErrors.value = errors
+  return { errors, warnings }
 }
 
 function replaceStep1DraftFromChat(payload: { content: string; status: 'human_review' }) {
@@ -1901,6 +2085,46 @@ function buildStep3FinalMarkdown(): string {
   return lines.join('\n')
 }
 
+const step14ExportDialogVisible = ref(false)
+const lastStep14ExportUrl = ref('')
+const lastStep14ExportFileName = ref('')
+
+function openStep14ExportDialog() {
+  step14ExportDialogVisible.value = true
+}
+
+async function submitStep14Export() {
+  if (!editor.value.trim()) {
+    ElMessage.warning('成品区内容为空，无法导出')
+    return
+  }
+  step14ExportSaving.value = true
+  try {
+    const res = await exportStep14Word(projectId.value, {
+      project_name: getGlobalProjectName(),
+      content_text: editor.value,
+      custom_title: step14ExportCustomTitle.value || null,
+    })
+    lastStep14ExportUrl.value = res.download_url
+    lastStep14ExportFileName.value = res.file_name
+    await downloadExportFile(res.download_url, res.file_name)
+    ElMessage.success('Step14 评价报告已导出并下载')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '导出失败')
+  } finally {
+    step14ExportSaving.value = false
+  }
+}
+
+async function downloadLastStep14Export() {
+  if (!lastStep14ExportUrl.value) return
+  try {
+    await downloadExportFile(lastStep14ExportUrl.value, lastStep14ExportFileName.value)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '下载失败')
+  }
+}
+
 async function stopCurrentRun() {
   if (!activeRunId.value) {
     ElMessage.warning('当前没有正在运行的生成任务')
@@ -2010,6 +2234,7 @@ onMounted(() => {
         <el-button v-if="stepId === 3 && step3SkeletonPhase === 'config'" type="primary" :loading="loading" @click="runStep3BuildSkeleton">构建指标体系骨架</el-button>
         <el-button v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3'" type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
         <el-button v-if="stepId === 3" type="success" :loading="saving" @click="finalizeStep3Workflow">完成 Step3 收尾并保存</el-button>
+        <el-button v-if="stepId === 14" type="warning" :loading="step14ExportSaving" :disabled="!editor.trim()" @click="openStep14ExportDialog">导出评价报告</el-button>
         <el-button :loading="saving" type="success" @click="saveCurrentStep">保存最终版本</el-button>
         <el-button v-if="stepId === 3" @click="loadResult">刷新 Step3 状态</el-button>
         <el-button type="primary" @click="chatOpen = true">AI 对话</el-button>
@@ -2029,7 +2254,7 @@ onMounted(() => {
             @stop="stopCurrentRun"
           />
 
-          <el-card v-if="stepId === 1 || stepId === 2 || stepId === 3" shadow="never">
+          <el-card shadow="never">
             <template #header>客户端模型配置</template>
             <el-alert
               type="success"
@@ -2780,6 +3005,146 @@ onMounted(() => {
             </template>
           </el-dialog>
 
+          <!-- Step4: 赋分 -->
+          <el-card v-if="stepId === 4" shadow="never">
+            <template #header>Step4 · 生成分值</template>
+            <el-alert v-if="!step4FlatL2Tasks.length" type="warning" :closable="false" show-icon title="未读取到 Step3 指标体系数据，请确保 Step3 已完成并保存。" />
+            <template v-else>
+              <el-alert type="info" :closable="false" show-icon class="mb" :title="`共加载 ${step4FlatL2Tasks.length} 项指标，总分 ${step4TotalScore}`" />
+              <el-form label-width="110px" class="mb">
+                <el-form-item label="赋分模式">
+                  <el-radio-group v-model="step4ScoringMode">
+                    <el-radio label="ai">AI 自动赋分</el-radio>
+                    <el-radio label="manual">人工赋分</el-radio>
+                  </el-radio-group>
+                </el-form-item>
+                <el-form-item label="总分设置">
+                  <el-input-number v-model="step4TotalScore" :min="1" :max="1000" :step="10" />
+                </el-form-item>
+              </el-form>
+              <el-table :data="step4FlatL2Tasks" size="small" stripe max-height="400">
+                <el-table-column label="序号" type="index" width="60" />
+                <el-table-column label="一级指标" prop="level1_name" min-width="140">
+                  <template #default="{ row }">
+                    <el-tag>{{ row.level1_name }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="二级指标" prop="level2_name" min-width="180" />
+                <el-table-column v-if="step4ScoringMode === 'manual'" label="分值" width="140" align="center">
+                  <template #default="{ row }">
+                    <el-input-number
+                      :model-value="step4ManualScores[`${row.level1_name}|${row.level2_name}`] ?? row.score ?? 0"
+                      :min="0"
+                      :max="100"
+                      :step="1"
+                      size="small"
+                      controls-position="right"
+                      style="width: 110px"
+                      @update:model-value="(val) => { step4ManualScores[`${row.level1_name}|${row.level2_name}`] = Number(val ?? 0) }"
+                    />
+                  </template>
+                </el-table-column>
+                <el-table-column v-if="step4ScoringMode === 'ai'" label="AI 分值" prop="score" width="100" align="center">
+                  <template #default="{ row }">
+                    {{ row.score ?? '-' }}
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-alert
+                v-for="(err, idx) in step4ValidationErrors"
+                :key="`v4err-${idx}`"
+                type="error"
+                :closable="false"
+                show-icon
+                class="mb"
+                :title="err"
+                style="margin-top: 8px;"
+              />
+              <div class="upload-toolbar">
+                <el-button v-if="step4ScoringMode === 'manual'" type="warning" @click="validateStep4Scores">校验分值</el-button>
+                <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">
+                  {{ step4ScoringMode === 'ai' ? 'AI 自动赋分' : '提交人工分值并生成' }}
+                </el-button>
+              </div>
+            </template>
+          </el-card>
+
+          <!-- Step5: 评分标准 -->
+          <el-card v-if="stepId === 5" shadow="never">
+            <template #header>Step5 · 评分标准</template>
+            <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step4 赋分结果，请确保 Step4 已完成并保存。" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="基于 Step4 赋分结果，生成各指标的详细评分标准。" />
+            <el-form label-width="110px" class="mb">
+              <el-form-item label="评分表备注">
+                <el-input v-model="step5ScoreSheet" type="textarea" :rows="4" placeholder="补充评分标准要求或约束（可选）" />
+              </el-form-item>
+            </el-form>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">生成评分标准</el-button>
+            </div>
+          </el-card>
+
+          <!-- Step6~8, Step10~13: 通用步骤 -->
+          <el-card v-if="stepId >= 6 && stepId <= 8 || stepId >= 10 && stepId <= 13" shadow="never">
+            <template #header>{{ titleMap[stepId] ?? `Step${stepId}` }}</template>
+            <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon :title="`未读取到 Step${stepId - 1} 结果，请确保上一步已完成并保存。`" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" :title="`基于 Step${stepId - 1} 输出内容继续生成。`" />
+            <el-form v-if="prevStepContent" label-width="110px" class="mb">
+              <el-form-item label="上一步内容">
+                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+              </el-form-item>
+            </el-form>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">开始生成</el-button>
+            </div>
+          </el-card>
+
+          <!-- Step9: 评价结论 + 风格 -->
+          <el-card v-if="stepId === 9" shadow="never">
+            <template #header>Step9 · 评价结论</template>
+            <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step8 结果，请确保上一步已完成并保存。" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="根据前序步骤内容生成评价结论，可选择结论语气风格。" />
+            <el-form label-width="110px" class="mb">
+              <el-form-item label="语气风格">
+                <el-radio-group v-model="step9StyleMode">
+                  <el-radio label="neutral">中性客观</el-radio>
+                  <el-radio label="sharp">尖锐直接</el-radio>
+                  <el-radio label="gentle">温和委婉</el-radio>
+                </el-radio-group>
+              </el-form-item>
+            </el-form>
+            <el-form v-if="prevStepContent" label-width="110px" class="mb">
+              <el-form-item label="上一步内容">
+                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+              </el-form-item>
+            </el-form>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">生成评价结论</el-button>
+            </div>
+          </el-card>
+
+          <!-- Step14: 评价报告 + 导出 -->
+          <el-card v-if="stepId === 14" shadow="never">
+            <template #header>Step14 · 评价报告</template>
+            <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step13 结果，请确保上一步已完成并保存。" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="汇总所有步骤结果，生成最终评价报告。完成后可导出 Word 文档。" />
+            <el-form label-width="110px" class="mb">
+              <el-form-item label="报告标题">
+                <el-input v-model="step14ExportCustomTitle" placeholder="例如 某项目绩效评价报告" />
+              </el-form-item>
+            </el-form>
+            <el-form v-if="prevStepContent" label-width="110px" class="mb">
+              <el-form-item label="上一步内容">
+                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+              </el-form-item>
+            </el-form>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">生成评价报告</el-button>
+              <el-button type="warning" :loading="step14ExportSaving" :disabled="!editor.trim()" @click="openStep14ExportDialog">导出 Word</el-button>
+              <el-button v-if="lastStep14ExportUrl" @click="downloadLastStep14Export">下载上次导出</el-button>
+            </div>
+          </el-card>
+
           <!-- Existing step1 cards -->
           <el-card v-if="stepId === 1" shadow="never">
             <template #header>Step1 成果区与导出</template>
@@ -2983,6 +3348,33 @@ onMounted(() => {
         <el-button @click="clearUploadQueue">清空</el-button>
         <el-button @click="uploadDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="uploading" @click="uploadQueuedFiles">开始上传</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="step14ExportDialogVisible" title="Step14 评价报告导出" width="620px" class="ef-confirm-dialog">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="导出会按当前成品区评价报告内容生成 Word 文档（.docx），并直接触发浏览器下载。"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="项目名称">
+          <el-input :model-value="getGlobalProjectName()" disabled />
+        </el-form-item>
+        <el-form-item label="报告标题">
+          <el-input v-model="step14ExportCustomTitle" placeholder="例如 某项目绩效评价报告" />
+        </el-form-item>
+        <el-form-item label="导出内容预览">
+          <el-input :model-value="editor" type="textarea" :rows="8" readonly />
+        </el-form-item>
+        <el-alert v-if="lastStep14ExportUrl" type="success" :closable="false" show-icon class="mb" :title="`已生成：${lastStep14ExportFileName}`" />
+      </el-form>
+      <template #footer>
+        <el-button @click="step14ExportDialogVisible = false">关闭</el-button>
+        <el-button v-if="lastStep14ExportUrl" @click="downloadLastStep14Export">下载上次导出</el-button>
+        <el-button type="primary" :loading="step14ExportSaving" @click="submitStep14Export">导出 Word 并下载</el-button>
       </template>
     </el-dialog>
 
