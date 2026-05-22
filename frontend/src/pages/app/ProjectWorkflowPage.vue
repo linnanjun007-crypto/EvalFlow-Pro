@@ -360,7 +360,14 @@ const taskProgress = computed(() => ({
   doneSteps: workflowStatus.value?.done_steps ?? 0,
   totalSteps: workflowStatus.value?.total_steps ?? 14,
 }))
-const canGenerate = computed(() => inputProjectFiles.value.length > 0 && enabledActiveModelConfigs.value.length > 0)
+const canGenerate = computed(() => {
+  if (!enabledActiveModelConfigs.value.length) return false
+  if (stepId.value === 3) {
+    const step2Core = step3State.value?.final_core_content ?? step3State.value?.content_text ?? step3State.value?.core_content_draft
+    return typeof step2Core === 'string' && step2Core.trim().length > 0
+  }
+  return inputProjectFiles.value.length > 0
+})
 const mediaFiles = computed(() => inputProjectFiles.value.filter((item) => isMediaFile(item.file_type, item.file_name)))
 const documentFiles = computed(() => inputProjectFiles.value.filter((item) => !isMediaFile(item.file_type, item.file_name)))
 const promptHintMap: Record<number, string> = {
@@ -832,7 +839,40 @@ async function loadResult() {
   if (stepId.value === 3 && !currentResult.value) {
     currentResult.value = step3State.value
   }
-  finalizeStep3Workflow()
+  if (stepId.value === 3) {
+    if (currentResult.value) {
+      syncStep3FromResult(currentResult.value)
+    }
+    finalizeStep3Workflow()
+  } else if (stepId.value === 2) {
+    try {
+      const res = await getStepResult('step2', projectId.value)
+      const step2Result = (res.result as Record<string, unknown>) || null
+      if (step2Result) {
+        currentResult.value = step2Result
+        resultText.value = JSON.stringify(step2Result, null, 2)
+        const comparisons = Array.isArray(step2Result.model_comparisons)
+          ? (step2Result.model_comparisons as Array<{ model_name?: string; label?: string; provider?: string; channel?: string; temperature?: number; draft?: string; error?: string }>)
+          : []
+        extractStep2State(step2Result, comparisons)
+      }
+    } catch {
+      // step2 not generated yet
+    }
+  } else if (stepId.value !== 1) {
+    try {
+      const res = await getStepResult(stepCodeOf(), projectId.value)
+      const saved = (res.result as Record<string, unknown>) || null
+      if (saved) {
+        currentResult.value = saved
+        resultText.value = JSON.stringify(saved, null, 2)
+        const text = readStep3FinishText(saved)
+        if (text.trim()) editor.value = text
+      }
+    } catch {
+      // no saved result for this step yet
+    }
+  }
 }
 
 function readStep3FinishText(source: Record<string, unknown> | null) {
@@ -1327,6 +1367,26 @@ function getGlobalProjectName() {
   return projectName.value.trim() || projectFiles.value.map(extractProjectNameFromFile).find((name) => Boolean(name)) || `项目 ${projectId.value}`
 }
 
+function buildStep1AgentPayload() {
+  const files = buildAgentPayloadFiles()
+  return {
+    project_id: projectId.value,
+    step_code: 'step1',
+    title: titleMap[1],
+    file_paths: files,
+    project_files: inputProjectFiles.value.map((item) => ({
+      id: item.id,
+      file_name: item.file_name,
+      file_type: item.file_type,
+      storage_key: item.storage_key,
+      parse_status: item.parse_status,
+    })),
+    project_name: getGlobalProjectName(),
+    thread_id: step1ThreadId.value,
+    has_step1_draft: Boolean(loadStep1DraftState()),
+  }
+}
+
 function buildStep2AgentPayload() {
   const files = buildAgentPayloadFiles()
   return {
@@ -1377,15 +1437,41 @@ function buildStep3AgentPayload() {
     template_id: step3Config.value.template_id,
     skeleton_optimize_mode: step3Config.value.skeleton_optimize_mode,
     per_optimize_level2_name: step3Config.value.per_optimize_level2_name,
-    review_mode: step3Config.value.review_mode,
-    review_feedback: step3Config.value.review_feedback,
+    review_mode: step3SkeletonPhase.value === 'generating_l3' ? step3L3ReviewMode.value : step3Config.value.review_mode,
+    review_feedback: step3SkeletonPhase.value === 'generating_l3'
+      ? (step3L3ReviewMode.value === 'modify' ? step3L3Feedback.value : '')
+      : step3Config.value.review_feedback,
+    flat_l2_tasks: step3SkeletonTasks.value,
+    active_l2_index: step3ActiveL2Index.value,
+    l3_active_draft: step3L3Draft.value,
     project_files: flattenedFiles,
   }
 }
 
+function buildGenericAgentPayload() {
+  const files = buildAgentPayloadFiles()
+  return {
+    project_id: projectId.value,
+    step_code: stepCodeOf(),
+    title: titleMap[stepId.value] ?? `Step ${stepId.value}`,
+    project_name: getGlobalProjectName(),
+    file_paths: files,
+    project_files: inputProjectFiles.value.map((item) => ({
+      id: item.id,
+      file_name: item.file_name,
+      file_type: item.file_type,
+      storage_key: item.storage_key,
+      parse_status: item.parse_status,
+    })),
+    content_text: editor.value,
+  }
+}
+
 function buildAgentPayloadByStep() {
+  if (stepId.value === 1) return buildStep1AgentPayload()
+  if (stepId.value === 2) return buildStep2AgentPayload()
   if (stepId.value === 3) return buildStep3AgentPayload()
-  return buildStep2AgentPayload()
+  return buildGenericAgentPayload()
 }
 
 function replaceStep1DraftFromChat(payload: { content: string; status: 'human_review' }) {
@@ -1450,10 +1536,16 @@ function replaceStep1DraftFromChat(payload: { content: string; status: 'human_re
 function parseStep3FlatL2Tasks(source: Record<string, unknown> | null): Step3L2Task[] {
   if (!source) return []
   const tasks = source['flat_l2_tasks']
-  if (Array.isArray(tasks)) {
-    return tasks.filter((t): t is Step3L2Task => Boolean(t) && typeof t === 'object')
-  }
-  return []
+  if (!Array.isArray(tasks)) return []
+  return tasks
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((row) => ({
+      level1_name: String(row.level1_name || row.level1 || ''),
+      level2_name: String(row.level2_name || row.level2 || ''),
+      target_l3_count: Math.max(1, Math.min(20, Number(row.target_l3_count) || 3)),
+      l3_section_markdown: String(row.l3_section_markdown || ''),
+    }))
+    .filter((task) => task.level1_name.trim() && task.level2_name.trim())
 }
 
 function parseStep3L3Comparisons(source: Record<string, unknown> | null): Array<{ model_name: string; label: string; draft: string; error: string }> {
@@ -1465,50 +1557,60 @@ function parseStep3L3Comparisons(source: Record<string, unknown> | null): Array<
   return []
 }
 
+function syncStep3FromResult(result: Record<string, unknown> | null) {
+  if (!result) return
+
+  const tasks = parseStep3FlatL2Tasks(result)
+  if (tasks.length) {
+    step3SkeletonTasks.value = tasks
+  }
+
+  if (typeof result.active_l2_index === 'number' && Number.isFinite(result.active_l2_index)) {
+    step3ActiveL2Index.value = Math.max(0, Math.min(step3SkeletonTasks.value.length - 1, result.active_l2_index as number))
+  }
+
+  const draft = result.l3_active_draft
+  if (typeof draft === 'string') {
+    step3L3Draft.value = draft
+  } else if (step3ActiveL2Task.value?.l3_section_markdown) {
+    step3L3Draft.value = step3ActiveL2Task.value.l3_section_markdown
+  }
+
+  const comparisons = parseStep3L3Comparisons(result)
+  if (comparisons.length) {
+    step3L3Comparisons.value = comparisons
+    compareItems.value = comparisons.map((item) => ({
+      label: item.label || item.model_name || '模型',
+      content: item.draft || (item.error ? `（调用失败：${item.error}）` : ''),
+    }))
+  }
+
+  if (typeof result.system_type === 'string' && result.system_type.trim()) {
+    step3Config.value.system_type = result.system_type
+  }
+  if (typeof result.indicator_depth === 'number') {
+    step3Config.value.indicator_depth = result.indicator_depth as 3 | 4
+  }
+
+  const status = String(result.status || '')
+  if (status === 'completed') {
+    step3SkeletonPhase.value = 'completed'
+    const finishText = readStep3FinishText(result)
+    if (finishText) editor.value = finishText
+  } else if (status === 'l3_draft_ready' || status === 'l3_refined' || status === 'l3_level_saved') {
+    step3SkeletonPhase.value = 'generating_l3'
+  } else if (status === 'skeleton_ready' || tasks.length > 0) {
+    step3SkeletonPhase.value = tasks.length && tasks.every((t) => t.l3_section_markdown) ? 'completed' : (tasks.some((t) => t.l3_section_markdown) ? 'generating_l3' : 'skeleton')
+  }
+
+  currentResult.value = result
+  resultText.value = JSON.stringify(result, null, 2)
+}
+
 function applyStep3Result(res: AgentRunResponse) {
   const payload = extractResult(res)
   const result = (payload && typeof payload === 'object' ? payload as Record<string, unknown> : null)
-
-  if (result) {
-    // Update skeleton tasks
-    const tasks = parseStep3FlatL2Tasks(result)
-    if (tasks.length) {
-      step3SkeletonTasks.value = tasks
-    }
-
-    // Update active L2 index
-    if (typeof result['active_l2_index'] === 'number') {
-      step3ActiveL2Index.value = result['active_l2_index'] as number
-    }
-
-    // Update current L3 draft
-    const draft = result['l3_active_draft']
-    if (typeof draft === 'string' && draft.trim()) {
-      step3L3Draft.value = draft
-    }
-
-    // Update L3 comparisons for multi-model
-    const comparisons = parseStep3L3Comparisons(result)
-    if (comparisons.length) {
-      step3L3Comparisons.value = comparisons
-    }
-
-    // Update phase
-    const status = String(result['status'] || '')
-    if (status === 'completed') {
-      step3SkeletonPhase.value = 'completed'
-      const finishText = readStep3FinishText(result)
-      if (finishText) editor.value = finishText
-    } else if (status === 'l3_draft_ready' || status === 'l3_refined' || status === 'l3_level_saved') {
-      step3SkeletonPhase.value = 'generating_l3'
-    } else if (status === 'skeleton_ready') {
-      step3SkeletonPhase.value = 'skeleton'
-    }
-
-    // Save result for display
-    currentResult.value = result
-    resultText.value = JSON.stringify(result, null, 2)
-  }
+  syncStep3FromResult(result)
 }
 
 async function runStep3BuildSkeleton() {
@@ -1549,7 +1651,6 @@ async function runStep3BuildSkeleton() {
       },
     })
     applyStep3Result(res)
-    step3SkeletonPhase.value = 'generating_l3'
     ElMessage.success('指标体系骨架已构建，正在逐个生成三级指标，请审阅当前结果')
   } catch (e) {
     error.value = e instanceof Error ? e.message : '构建骨架失败'
@@ -1831,7 +1932,7 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
       payload: { ...payload, prompt, run_id: runId, model_configs: effectiveModelConfigs, temperature: primary.temperature },
       context: {
         project_id: projectId.value,
-        thread_id: stepId.value === 1 ? step1ThreadId.value : undefined,
+        thread_id: stepId.value === 1 ? step1ThreadId.value : (stepId.value === 3 ? `step3:${projectId.value}` : undefined),
         workflow_role: 'client',
         run_id: runId,
         model_provider: primary.provider,
@@ -1860,7 +1961,11 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
     if (stepId.value === 1) {
       pushStep1DraftSnapshot(editor.value, 'before_generate')
     }
-    applyAgentResult(res)
+    if (stepId.value === 3) {
+      applyStep3Result(res)
+    } else {
+      applyAgentResult(res)
+    }
     if (stepId.value === 1) {
       pushStep1DraftSnapshot(editor.value, 'generate')
       saveStep1DraftState({
@@ -1900,10 +2005,10 @@ onMounted(() => {
         <el-button @click="router.push(`/app/projects/${projectId}/overview`)">回总览</el-button>
         <el-button @click="historyOpen = true">历史</el-button>
         <el-button v-if="stepId === 1" @click="openUploadDialog('documents')">资料上传窗口</el-button>
-        <el-button v-if="stepId === 2" type="primary" :loading="loading" @click="runStep('')">一键生成 Step2</el-button>
+        <el-button v-if="stepId === 2" type="primary" :loading="loading" :disabled="!step2HasFiles" @click="runStep('')">一键生成 Step2</el-button>
         <el-button v-if="stepId === 2" type="warning" :loading="step2ExportSaving" @click="openStep2ExportDialog">成果导出</el-button>
         <el-button v-if="stepId === 3 && step3SkeletonPhase === 'config'" type="primary" :loading="loading" @click="runStep3BuildSkeleton">构建指标体系骨架</el-button>
-        <el-button v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3'" type="primary" :loading="loading" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
+        <el-button v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3'" type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
         <el-button v-if="stepId === 3" type="success" :loading="saving" @click="finalizeStep3Workflow">完成 Step3 收尾并保存</el-button>
         <el-button :loading="saving" type="success" @click="saveCurrentStep">保存最终版本</el-button>
         <el-button v-if="stepId === 3" @click="loadResult">刷新 Step3 状态</el-button>
@@ -1924,7 +2029,7 @@ onMounted(() => {
             @stop="stopCurrentRun"
           />
 
-          <el-card v-if="stepId === 1 || stepId === 2" shadow="never">
+          <el-card v-if="stepId === 1 || stepId === 2 || stepId === 3" shadow="never">
             <template #header>客户端模型配置</template>
             <el-alert
               type="success"
@@ -2127,7 +2232,7 @@ onMounted(() => {
                 </div>
               </div>
             </div>
-            <el-alert v-if="!inputProjectFiles.length" type="warning" :closable="false" show-icon title="请先上传资料，再执行 Step2 生成。" />
+            <el-alert v-if="!step2HasFiles" type="warning" :closable="false" show-icon title="请先上传资料，再执行 Step2 生成。" />
           </el-card>
 
           <el-card v-if="stepId === 2" shadow="never">
@@ -2175,7 +2280,7 @@ onMounted(() => {
                 v-for="category in DEFAULT_STEP2_CATEGORIES"
                 :key="category"
                 :model-value="step2DefaultCategories.includes(category)"
-                @update:model-value="(value: boolean) => toggleStep2DefaultCategory(category, value)"
+                @update:model-value="(value) => toggleStep2DefaultCategory(category, value === true)"
               >
                 {{ category }}
               </el-checkbox>
@@ -2351,70 +2456,70 @@ onMounted(() => {
             </div>
           </el-card>
 
-          <ModelCompareTabs v-if=”compareItems.length && stepId === 3” :items=”compareItems” />
+          <ModelCompareTabs v-if="compareItems.length && stepId === 3" :items="compareItems" />
           <!-- Step3: 配置阶段 -->
-          <el-card v-if=”stepId === 3 && step3SkeletonPhase === 'config'” shadow=”never”>
+          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'config'" shadow="never">
             <template #header>Step3 · 指标体系配置</template>
-            <el-alert v-if=”!step3State?.core_basis_digest && !step3State?.project_core_content” type=”warning” :closable=”false” show-icon title=”当前尚未读取到 Step2 核心内容，请先确保 Step2 已定稿并保存。” />
-            <el-alert v-else type=”success” :closable=”false” show-icon class=”mb” title=”已读取 Step2 核心内容，下方配置完成后即可构建指标体系。” />
-            <el-form label-width=”120px”>
-              <el-form-item label=”体系类型”>
-                <el-select v-model=”step3Config.system_type” style=”width: 100%” @change=”step3SkeletonTasks = []”>
-                  <el-option label=”项目支出指标体系” value=”项目支出指标体系” />
-                  <el-option label=”部门整体指标体系” value=”部门整体指标体系” />
-                  <el-option label=”下级政府整体运行指标体系” value=”下级政府整体运行指标体系” />
-                  <el-option label=”专项债指标体系” value=”专项债指标体系” />
-                  <el-option label=”社保基金指标体系” value=”社保基金指标体系” />
-                  <el-option label=”自定义（LLM 自动生成）” value=”自定义” />
+            <el-alert v-if="!step3State?.core_basis_digest && !step3State?.project_core_content" type="warning" :closable="false" show-icon title="当前尚未读取到 Step2 核心内容，请先确保 Step2 已定稿并保存。" />
+            <el-alert v-else type="success" :closable="false" show-icon class="mb" title="已读取 Step2 核心内容，下方配置完成后即可构建指标体系。" />
+            <el-form label-width="120px">
+              <el-form-item label="体系类型">
+                <el-select v-model="step3Config.system_type" style="width: 100%" @change="step3SkeletonTasks = []">
+                  <el-option label="项目支出指标体系" value="项目支出指标体系" />
+                  <el-option label="部门整体指标体系" value="部门整体指标体系" />
+                  <el-option label="下级政府整体运行指标体系" value="下级政府整体运行指标体系" />
+                  <el-option label="专项债指标体系" value="专项债指标体系" />
+                  <el-option label="社保基金指标体系" value="社保基金指标体系" />
+                  <el-option label="自定义（LLM 自动生成）" value="自定义" />
                 </el-select>
               </el-form-item>
-              <el-form-item label=”指标深度”>
-                <el-radio-group v-model=”step3Config.indicator_depth”>
-                  <el-radio :label=”3”>3 级（标准）</el-radio>
-                  <el-radio :label=”4”>4 级（含四级细项）</el-radio>
+              <el-form-item label="指标深度">
+                <el-radio-group v-model="step3Config.indicator_depth">
+                  <el-radio :label="3">3 级（标准）</el-radio>
+                  <el-radio :label="4">4 级（含四级细项）</el-radio>
                 </el-radio-group>
               </el-form-item>
-              <el-form-item label=”导入模式”>
-                <el-radio-group v-model=”step3Config.import_mode” @change=”() => { step3SkeletonTasks = []; step3Config.imported_indicator_json = ''; }”>
-                  <el-radio label=”none”>不导入（按类型自动生成）</el-radio>
-                  <el-radio label=”template”>模板库一键导入</el-radio>
-                  <el-radio label=”own”>自有 JSON 导入</el-radio>
+              <el-form-item label="导入模式">
+                <el-radio-group v-model="step3Config.import_mode" @change="() => { step3SkeletonTasks = []; step3Config.imported_indicator_json = ''; }">
+                  <el-radio label="none">不导入（按类型自动生成）</el-radio>
+                  <el-radio label="template">模板库一键导入</el-radio>
+                  <el-radio label="own">自有 JSON 导入</el-radio>
                 </el-radio-group>
               </el-form-item>
-              <el-form-item v-if=”step3Config.import_mode === 'template'” label=”选择模板”>
-                <div style=”display: flex; gap: 10px; align-items: center; width: 100%;”>
-                  <el-select v-model=”step3Config.template_id” style=”flex: 1”>
-                    <el-option v-for=”tpl in step3Templates” :key=”tpl.id” :label=”tpl.name” :value=”tpl.id” />
+              <el-form-item v-if="step3Config.import_mode === 'template'" label="选择模板">
+                <div style="display: flex; gap: 10px; align-items: center; width: 100%;">
+                  <el-select v-model="step3Config.template_id" style="flex: 1">
+                    <el-option v-for="tpl in step3Templates" :key="tpl.id" :label="tpl.name" :value="tpl.id" />
                   </el-select>
-                  <el-button @click=”applyStep3Template”>应用模板</el-button>
+                  <el-button @click="applyStep3Template">应用模板</el-button>
                 </div>
-                <el-card v-if=”step3TemplatePreview” shadow=”never” style=”margin-top: 8px; background: var(--el-fill-color-lighter);”>
+                <el-card v-if="step3TemplatePreview" shadow="never" style="margin-top: 8px; background: var(--el-fill-color-lighter);">
                   <template #header>模板预览：{{ step3TemplatePreview.name }}</template>
-                  <div v-for=”t in step3TemplatePreview.tasks” :key=”t.level1_name + t.level2_name” style=”padding: 2px 0; font-size: 13px;”>
+                  <div v-for="t in step3TemplatePreview.tasks" :key="t.level1_name + t.level2_name" style="padding: 2px 0; font-size: 13px;">
                     {{ t.level1_name }} → {{ t.level2_name }}（三级数量：{{ t.target_l3_count }}）
                   </div>
                 </el-card>
               </el-form-item>
-              <el-form-item v-if=”step3Config.import_mode === 'own'” label=”导入方式”>
-                <div style=”display: flex; gap: 10px; align-items: center; flex-wrap: wrap;”>
+              <el-form-item v-if="step3Config.import_mode === 'own'" label="导入方式">
+                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                   <el-upload
-                    :auto-upload=”false”
-                    :show-file-list=”false”
-                    :limit=”1”
-                    accept=”.json”
-                    :on-change=”(file: UploadFile) => file.raw && handleStep3ImportJsonFile(file.raw)”
+                    :auto-upload="false"
+                    :show-file-list="false"
+                    :limit="1"
+                    accept=".json"
+                    :on-change="(file: UploadFile) => file.raw && handleStep3ImportJsonFile(file.raw)"
                   >
                     <el-button>上传 JSON 文件</el-button>
                   </el-upload>
-                  <span style=”color: var(--el-text-color-secondary); font-size: 12px;”>或手动粘贴</span>
+                  <span style="color: var(--el-text-color-secondary); font-size: 12px;">或手动粘贴</span>
                 </div>
                 <el-input
-                  v-model=”step3Config.imported_indicator_json”
-                  type=”textarea”
-                  :rows=”6”
-                  placeholder='格式：{“tasks”:[{“level1”:”决策”,”level2”:”依据充分”,”target_l3_count”:3}]}'
-                  style=”margin-top: 8px;”
-                  @blur=”() => {
+                  v-model="step3Config.imported_indicator_json"
+                  type="textarea"
+                  :rows="6"
+                  placeholder='格式：{"tasks":[{"level1":"决策","level2":"依据充分","target_l3_count":3}]}'
+                  style="margin-top: 8px;"
+                  @blur="() => {
                     if (step3Config.imported_indicator_json.trim()) {
                       try {
                         const data = JSON.parse(step3Config.imported_indicator_json)
@@ -2429,238 +2534,254 @@ onMounted(() => {
                         }
                       } catch {}
                     }
-                  }”
+                  }"
                 />
               </el-form-item>
-              <el-form-item label=”骨架优化”>
-                <el-radio-group v-model=”step3Config.skeleton_optimize_mode”>
-                  <el-radio label=”none”>不优化</el-radio>
-                  <el-radio label=”one_click”>一键优化（LLM 对照核心内容）</el-radio>
-                  <el-radio label=”per_level2”>按二级指标逐个优化</el-radio>
+              <el-form-item label="骨架优化">
+                <el-radio-group v-model="step3Config.skeleton_optimize_mode">
+                  <el-radio label="none">不优化</el-radio>
+                  <el-radio label="one_click">一键优化（LLM 对照核心内容）</el-radio>
+                  <el-radio label="per_level2">按二级指标逐个优化</el-radio>
                 </el-radio-group>
               </el-form-item>
-              <el-form-item v-if=”step3Config.skeleton_optimize_mode === 'per_level2'” label=”优化目标”>
-                <el-input v-model=”step3Config.per_optimize_level2_name” placeholder=”输入要优化的二级指标名称” />
+              <el-form-item v-if="step3Config.skeleton_optimize_mode === 'per_level2'" label="优化目标">
+                <el-input v-model="step3Config.per_optimize_level2_name" placeholder="输入要优化的二级指标名称" />
               </el-form-item>
             </el-form>
-            <el-alert type=”info” :closable=”false” show-icon class=”mb” title=”点击下方按钮，系统将根据配置构建指标体系骨架，并逐个二级指标生成三级指标与解释。” />
-            <div class=”upload-toolbar”>
-              <el-button type=”primary” size=”large” :loading=”loading” @click=”runStep3BuildSkeleton” :disabled=”!step3State?.core_basis_digest && !step3State?.project_core_content && !step3State?.final_core_content”>
+            <el-alert type="info" :closable="false" show-icon class="mb" title="点击下方按钮，系统将根据配置构建指标体系骨架，并逐个二级指标生成三级指标与解释。" />
+            <div class="upload-toolbar">
+              <el-button type="primary" size="large" :loading="loading" @click="runStep3BuildSkeleton" :disabled="!step3State?.core_basis_digest && !step3State?.project_core_content && !step3State?.final_core_content">
                 构建指标体系骨架
               </el-button>
             </div>
           </el-card>
 
           <!-- Step3: 骨架编辑 & L3 生成阶段 -->
-          <el-card v-if=”stepId === 3 && (step3SkeletonPhase === 'skeleton' || step3SkeletonPhase === 'generating_l3')” shadow=”never”>
+          <el-card v-if="stepId === 3 && (step3SkeletonPhase === 'skeleton' || step3SkeletonPhase === 'generating_l3')" shadow="never">
             <template #header>Step3 · 指标体系骨架管理</template>
-            <el-alert type=”success” :closable=”false” show-icon class=”mb” title=”骨架已就绪，可增删改一级/二级指标，调整三级数量，然后逐个生成三级指标与解释。” />
-            <div style=”margin-bottom: 12px; display: flex; gap: 10px; flex-wrap: wrap;”>
-              <el-button size=”small” type=”primary” @click=”step3SkeletonAddL1DialogVisible = true”>+ 新增一级指标</el-button>
-              <el-button size=”small” type=”success” @click=”step3SkeletonAddL2DialogVisible = true”>+ 新增二级指标</el-button>
+            <el-alert type="success" :closable="false" show-icon class="mb" title="骨架已就绪，可增删改一级/二级指标，调整三级数量，然后逐个生成三级指标与解释。" />
+            <el-alert
+              v-if="Object.keys(step3GroupedL1).length"
+              type="info"
+              :closable="false"
+              show-icon
+              class="mb"
+              :title="`骨架概览：${Object.keys(step3GroupedL1).length} 个一级指标，${step3SkeletonTasks.length} 个二级指标（${step3L2Progress.completed}/${step3L2Progress.total} 项三级已完成）`"
+            />
+            <div style="margin-bottom: 12px; display: flex; gap: 10px; flex-wrap: wrap;">
+              <el-button size="small" type="primary" @click="step3SkeletonAddL1DialogVisible = true">+ 新增一级指标</el-button>
+              <el-button size="small" type="success" @click="step3SkeletonAddL2DialogVisible = true">+ 新增二级指标</el-button>
             </div>
-            <el-table :data=”step3SkeletonTasks” size=”small” stripe max-height=”360”>
-              <el-table-column label=”序号” type=”index” width=”60” />
-              <el-table-column label=”一级指标” prop=”level1_name” min-width=”140”>
-                <template #default=”{ row }”>
+            <el-table :data="step3SkeletonTasks" size="small" stripe max-height="360">
+              <el-table-column label="序号" type="index" width="60" />
+              <el-table-column label="一级指标" prop="level1_name" min-width="140">
+                <template #default="{ row }">
                   <el-tag>{{ row.level1_name }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label=”二级指标” prop=”level2_name” min-width=”180” />
-              <el-table-column label=”三级数量” prop=”target_l3_count” width=”100” align=”center”>
-                <template #default=”{ row }”>
+              <el-table-column label="二级指标" prop="level2_name" min-width="180" />
+              <el-table-column label="三级数量" prop="target_l3_count" width="100" align="center">
+                <template #default="{ row }">
                   <el-input-number
-                    :model-value=”row.target_l3_count”
-                    :min=”1”
-                    :max=”20”
-                    size=”small”
-                    controls-position=”right”
-                    style=”width: 80px”
-                    @update:model-value=”(val: number) => { row.target_l3_count = val }”
+                    :model-value="row.target_l3_count"
+                    :min="1"
+                    :max="20"
+                    size="small"
+                    controls-position="right"
+                    style="width: 80px"
+                    @update:model-value="(val) => { if (typeof val === 'number') row.target_l3_count = val }"
                   />
                 </template>
               </el-table-column>
-              <el-table-column label=”三级状态” width=”120” align=”center”>
-                <template #default=”{ row }”>
-                  <el-tag v-if=”row.l3_section_markdown” type=”success” size=”small”>已完成</el-tag>
-                  <el-tag v-else-if=”step3ActiveL2Task && step3ActiveL2Task.level1_name === row.level1_name && step3ActiveL2Task.level2_name === row.level2_name” type=”warning” size=”small”>进行中</el-tag>
-                  <el-tag v-else type=”info” size=”small”>待处理</el-tag>
+              <el-table-column label="三级状态" width="120" align="center">
+                <template #default="{ row }">
+                  <el-tag v-if="row.l3_section_markdown" type="success" size="small">已完成</el-tag>
+                  <el-tag v-else-if="step3ActiveL2Task && step3ActiveL2Task.level1_name === row.level1_name && step3ActiveL2Task.level2_name === row.level2_name" type="warning" size="small">进行中</el-tag>
+                  <el-tag v-else type="info" size="small">待处理</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label=”操作” width=”200” align=”center”>
-                <template #default=”{ row, $index }”>
-                  <el-button size=”small” @click=”openSkeletonEditDialog(row)”>编辑</el-button>
-                  <el-button size=”small” type=”danger” plain @click=”removeSkeletonTask(row)”>删除</el-button>
-                  <el-button size=”small” type=”primary” plain @click=”selectStep3L2($index)”>处理</el-button>
+              <el-table-column label="操作" width="200" align="center">
+                <template #default="{ row, $index }">
+                  <el-button size="small" @click="openSkeletonEditDialog(row)">编辑</el-button>
+                  <el-button size="small" type="danger" plain @click="removeSkeletonTask(row)">删除</el-button>
+                  <el-button size="small" type="primary" plain @click="selectStep3L2($index)">处理</el-button>
                 </template>
               </el-table-column>
             </el-table>
-            <div class=”upload-toolbar” style=”margin-top: 12px;”>
-              <el-button type=”primary” :loading=”loading” @click=”runStep3BuildSkeleton”>重新构建骨架</el-button>
-              <el-button @click=”step3Config.skeleton_optimize_mode = 'one_click'; runStep3BuildSkeleton()”>一键优化骨架</el-button>
+            <div class="upload-toolbar" style="margin-top: 12px;">
+              <el-button type="primary" :loading="loading" @click="runStep3BuildSkeleton">重新构建骨架</el-button>
+              <el-button @click="step3Config.skeleton_optimize_mode = 'one_click'; runStep3BuildSkeleton()">一键优化骨架</el-button>
             </div>
           </el-card>
 
           <!-- Step3: 逐个二级指标生成三级指标 -->
-          <el-card v-if=”stepId === 3 && step3SkeletonPhase === 'generating_l3' && step3ActiveL2Task” shadow=”never”>
+          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3' && step3ActiveL2Task" shadow="never">
             <template #header>
               Step3 · 三级指标生成 —
               当前：{{ step3ActiveL2Task.level1_name }} → {{ step3ActiveL2Task.level2_name }}
               （第 {{ step3ActiveL2Index + 1 }}/{{ step3SkeletonTasks.length }} 个）
             </template>
-            <el-progress :percentage=”step3L2Progress.percent” :text-inside=”true” :stroke-width=”20” style=”margin-bottom: 12px;” />
-            <div class=”step3-summary-grid”>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>当前一级指标</div>
-                <div class=”step3-summary-value”>{{ step3ActiveL2Task.level1_name }}</div>
+            <el-progress :percentage="step3L2Progress.percent" :text-inside="true" :stroke-width="20" style="margin-bottom: 12px;" />
+            <div class="step3-summary-grid">
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">当前一级指标</div>
+                <div class="step3-summary-value">{{ step3ActiveL2Task.level1_name }}</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>当前二级指标</div>
-                <div class=”step3-summary-value”>{{ step3ActiveL2Task.level2_name }}</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">当前二级指标</div>
+                <div class="step3-summary-value">{{ step3ActiveL2Task.level2_name }}</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>需要三级指标数</div>
-                <div class=”step3-summary-value”>{{ step3ActiveL2Task.target_l3_count }} 个</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">需要三级指标数</div>
+                <div class="step3-summary-value">{{ step3ActiveL2Task.target_l3_count }} 个</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>进度</div>
-                <div class=”step3-summary-value”>{{ step3ActiveL2Index + 1 }} / {{ step3SkeletonTasks.length }}</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">进度</div>
+                <div class="step3-summary-value">{{ step3ActiveL2Index + 1 }} / {{ step3SkeletonTasks.length }}</div>
               </div>
             </div>
 
             <!-- LLM 生成按钮 -->
-            <el-alert type=”info” :closable=”false” show-icon class=”mb” title=”点击下方按钮，由大模型根据第二步核心内容生成本二级指标下的三级指标与指标解释。支持多模型并行对比。” />
-            <div class=”upload-toolbar”>
-              <el-button type=”primary” :loading=”loading” @click=”step3L3ReviewMode = 'approve'; runStep3Continue()”>生成三级指标</el-button>
-              <el-button @click=”chatOpen = true”>通过 AI 对话生成</el-button>
+            <el-alert type="info" :closable="false" show-icon class="mb" title="点击下方按钮，由大模型根据第二步核心内容生成本二级指标下的三级指标与指标解释。支持多模型并行对比。" />
+            <el-alert
+              v-if="step3AllL2Completed"
+              type="success"
+              :closable="false"
+              show-icon
+              class="mb"
+              title="全部二级指标的三级内容已就绪，可点击「保存并完成全部三级指标」，或使用顶部「完成 Step3 收尾并保存」定稿。"
+            />
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
+              <el-button @click="chatOpen = true">通过 AI 对话生成</el-button>
             </div>
 
             <!-- 多模型对比 -->
-            <el-card v-if=”step3L3Comparisons.length > 1” shadow=”never” style=”margin-top: 12px; background: var(--el-fill-color-lighter);”>
+            <el-card v-if="step3L3Comparisons.length > 1" shadow="never" style="margin-top: 12px; background: var(--el-fill-color-lighter);">
               <template #header>多模型对比（共 {{ step3L3Comparisons.length }} 个模型）</template>
-              <div class=”step2-compare-layout”>
-                <div class=”step2-compare-list”>
+              <div class="step2-compare-layout">
+                <div class="step2-compare-list">
                   <div
-                    v-for=”(item, idx) in step3L3Comparisons”
-                    :key=”`l3-cmp-${idx}`”
-                    class=”step2-compare-card”
-                    style=”cursor: pointer;”
-                    @click=”applyL3Comparison(idx)”
+                    v-for="(item, idx) in step3L3Comparisons"
+                    :key="`l3-cmp-${idx}`"
+                    class="step2-compare-card"
+                    style="cursor: pointer;"
+                    @click="applyL3Comparison(idx)"
                   >
-                    <div class=”step2-compare-title”>{{ item.label || item.model_name }}</div>
-                    <el-tag v-if=”item.error” type=”danger” size=”small”>调用失败</el-tag>
-                    <el-tag v-else type=”success” size=”small”>{{ (item.draft || '').length }} 字</el-tag>
+                    <div class="step2-compare-title">{{ item.label || item.model_name }}</div>
+                    <el-tag v-if="item.error" type="danger" size="small">调用失败</el-tag>
+                    <el-tag v-else type="success" size="small">{{ (item.draft || '').length }} 字</el-tag>
                   </div>
                 </div>
               </div>
             </el-card>
 
             <!-- 当前三级指标草案 -->
-            <el-form label-width=”110px” style=”margin-top: 12px;”>
-              <el-form-item label=”三级指标草案”>
-                <el-input v-model=”step3L3Draft” type=”textarea” :rows=”12” placeholder=”三级指标草案将显示在这里，支持直接编辑” />
+            <el-form label-width="110px" style="margin-top: 12px;">
+              <el-form-item label="三级指标草案">
+                <el-input v-model="step3L3Draft" type="textarea" :rows="12" placeholder="三级指标草案将显示在这里，支持直接编辑" />
               </el-form-item>
-              <el-form-item label=”修改意见”>
-                <el-input v-model=”step3L3Feedback” type=”textarea” :rows=”3” placeholder=”输入修改意见，让大模型根据意见重新生成（可选）” />
+              <el-form-item label="修改意见">
+                <el-input v-model="step3L3Feedback" type="textarea" :rows="3" placeholder="输入修改意见，让大模型根据意见重新生成（可选）" />
               </el-form-item>
             </el-form>
 
             <!-- 操作按钮 -->
-            <div class=”upload-toolbar”>
-              <el-button type=”primary” :loading=”loading” @click=”manualSaveCurrentL3”>保存当前草案（手动）</el-button>
-              <el-button type=”success” :loading=”loading” @click=”approveL3AndNext”>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" @click="manualSaveCurrentL3">保存当前草案（手动）</el-button>
+              <el-button type="success" :loading="loading" @click="approveL3AndNext">
                 {{ step3ActiveL2Index + 1 < step3SkeletonTasks.length ? '保存并进入下一个二级指标' : '保存并完成全部三级指标' }}
               </el-button>
-              <el-button v-if=”step3L3Feedback.trim()” type=”warning” :loading=”loading” @click=”step3L3ReviewMode = 'modify'; runStep3Continue()”>
+              <el-button v-if="step3L3Feedback.trim()" type="warning" :loading="loading" @click="step3L3ReviewMode = 'modify'; runStep3Continue()">
                 提交修改意见，让 AI 重新生成
               </el-button>
-              <el-button @click=”chatOpen = true”>通过对话修改</el-button>
+              <el-button @click="chatOpen = true">通过对话修改</el-button>
             </div>
           </el-card>
 
           <!-- Step3: 完成阶段 -->
-          <el-card v-if=”stepId === 3 && step3SkeletonPhase === 'completed'” shadow=”never”>
+          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'completed'" shadow="never">
             <template #header>Step3 · 指标体系已完成</template>
-            <el-alert type=”success” :closable=”false” show-icon class=”mb” title=”全部二级指标的三级指标与解释已处理完毕，可进入定稿环节。” />
-            <div class=”step3-summary-grid”>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>体系类型</div>
-                <div class=”step3-summary-value”>{{ step3Config.system_type }}</div>
+            <el-alert type="success" :closable="false" show-icon class="mb" title="全部二级指标的三级指标与解释已处理完毕，可进入定稿环节。" />
+            <div class="step3-summary-grid">
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">体系类型</div>
+                <div class="step3-summary-value">{{ step3Config.system_type }}</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>指标深度</div>
-                <div class=”step3-summary-value”>{{ step3Config.indicator_depth }} 级</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">指标深度</div>
+                <div class="step3-summary-value">{{ step3Config.indicator_depth }} 级</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>二级指标总数</div>
-                <div class=”step3-summary-value”>{{ step3SkeletonTasks.length }} 个</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">二级指标总数</div>
+                <div class="step3-summary-value">{{ step3SkeletonTasks.length }} 个</div>
               </div>
-              <div class=”step3-summary-card”>
-                <div class=”step3-summary-title”>已完成三级</div>
-                <div class=”step3-summary-value”>{{ step3L2Progress.completed }} / {{ step3L2Progress.total }}</div>
+              <div class="step3-summary-card">
+                <div class="step3-summary-title">已完成三级</div>
+                <div class="step3-summary-value">{{ step3L2Progress.completed }} / {{ step3L2Progress.total }}</div>
               </div>
             </div>
             <el-alert
-              type=”success”
-              :closable=”false”
+              type="success"
+              :closable="false"
               show-icon
-              :title=”`已聚合 ${step3SkeletonTasks.length} 项二级指标。点击”完成 Step3 收尾并保存”即可一次性定稿，成品区将展示完整的指标体系。`”
+              :title="`已聚合 ${step3SkeletonTasks.length} 项二级指标。点击「完成 Step3 收尾并保存」即可一次性定稿，成品区将展示完整的指标体系。`"
             />
           </el-card>
 
           <!-- 骨架编辑对话框 -->
-          <el-dialog v-model=”step3SkeletonEditDialogVisible” title=”编辑指标” width=”500px”>
-            <el-form label-width=”120px”>
-              <el-form-item label=”一级指标名称”>
-                <el-input v-model=”step3SkeletonEditForm.level1_name” />
+          <el-dialog v-model="step3SkeletonEditDialogVisible" title="编辑指标" width="500px">
+            <el-form label-width="120px">
+              <el-form-item label="一级指标名称">
+                <el-input v-model="step3SkeletonEditForm.level1_name" />
               </el-form-item>
-              <el-form-item label=”二级指标名称”>
-                <el-input v-model=”step3SkeletonEditForm.level2_name” />
+              <el-form-item label="二级指标名称">
+                <el-input v-model="step3SkeletonEditForm.level2_name" />
               </el-form-item>
-              <el-form-item label=”三级指标数量”>
-                <el-input-number v-model=”step3SkeletonEditForm.target_l3_count” :min=”1” :max=”20” />
+              <el-form-item label="三级指标数量">
+                <el-input-number v-model="step3SkeletonEditForm.target_l3_count" :min="1" :max="20" />
               </el-form-item>
             </el-form>
             <template #footer>
-              <el-button @click=”step3SkeletonEditDialogVisible = false”>取消</el-button>
-              <el-button type=”primary” @click=”saveSkeletonEdit”>保存</el-button>
+              <el-button @click="step3SkeletonEditDialogVisible = false">取消</el-button>
+              <el-button type="primary" @click="saveSkeletonEdit">保存</el-button>
             </template>
           </el-dialog>
 
           <!-- 新增一级指标对话框 -->
-          <el-dialog v-model=”step3SkeletonAddL1DialogVisible” title=”新增一级指标” width=”450px”>
-            <el-form label-width=”120px”>
-              <el-form-item label=”一级指标名称”>
-                <el-input v-model=”step3NewL1Name” placeholder=”例如：决策环节” />
+          <el-dialog v-model="step3SkeletonAddL1DialogVisible" title="新增一级指标" width="450px">
+            <el-form label-width="120px">
+              <el-form-item label="一级指标名称">
+                <el-input v-model="step3NewL1Name" placeholder="例如：决策环节" />
               </el-form-item>
             </el-form>
             <template #footer>
-              <el-button @click=”step3SkeletonAddL1DialogVisible = false”>取消</el-button>
-              <el-button type=”primary” @click=”addSkeletonL1”>添加</el-button>
+              <el-button @click="step3SkeletonAddL1DialogVisible = false">取消</el-button>
+              <el-button type="primary" @click="addSkeletonL1">添加</el-button>
             </template>
           </el-dialog>
 
           <!-- 新增二级指标对话框 -->
-          <el-dialog v-model=”step3SkeletonAddL2DialogVisible” title=”新增二级指标” width=”500px”>
-            <el-form label-width=”120px”>
-              <el-form-item label=”所属一级指标”>
-                <el-input v-model=”step3NewL2Form.level1_name” placeholder=”一级指标名称” />
+          <el-dialog v-model="step3SkeletonAddL2DialogVisible" title="新增二级指标" width="500px">
+            <el-form label-width="120px">
+              <el-form-item label="所属一级指标">
+                <el-input v-model="step3NewL2Form.level1_name" placeholder="一级指标名称" />
               </el-form-item>
-              <el-form-item label=”二级指标名称”>
-                <el-input v-model=”step3NewL2Form.level2_name” placeholder=”例如：预算编制规范性” />
+              <el-form-item label="二级指标名称">
+                <el-input v-model="step3NewL2Form.level2_name" placeholder="例如：预算编制规范性" />
               </el-form-item>
-              <el-form-item label=”三级指标数量”>
-                <el-input-number v-model=”step3NewL2Form.target_l3_count” :min=”1” :max=”20” />
+              <el-form-item label="三级指标数量">
+                <el-input-number v-model="step3NewL2Form.target_l3_count" :min="1" :max="20" />
               </el-form-item>
             </el-form>
             <template #footer>
-              <el-button @click=”step3SkeletonAddL2DialogVisible = false”>取消</el-button>
-              <el-button type=”primary” @click=”addSkeletonL2”>添加</el-button>
+              <el-button @click="step3SkeletonAddL2DialogVisible = false">取消</el-button>
+              <el-button type="primary" @click="addSkeletonL2">添加</el-button>
             </template>
           </el-dialog>
 
           <!-- Existing step1 cards -->
-          <el-card v-if=”stepId === 1” shadow=”never”>
+          <el-card v-if="stepId === 1" shadow="never">
             <template #header>Step1 成果区与导出</template>
             <el-alert
               type="success"
@@ -2719,7 +2840,7 @@ onMounted(() => {
       :step-code="stepCodeOf()"
       :step-title="titleMap[stepId] ?? `Step ${stepId}`"
       :prompt-hint="promptHintMap[stepId] ?? '输入本步骤补充指令或约束'"
-      :thread-id="stepId === 1 ? step1ThreadId : undefined"
+      :thread-id="stepId === 1 ? step1ThreadId : (stepId === 3 ? `step3:${projectId}` : undefined)"
       :workflow-state="workflowState"
       @replace-draft="replaceStep1DraftFromChat"
     />
