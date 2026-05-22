@@ -482,7 +482,6 @@ async function submitStep1Export(downloadAfter = true) {
   exportSaving.value = true
   try {
     const response = await exportStep1(projectId.value, {
-      user_id: 'demo-user-id',
       project_name: getGlobalProjectName(),
       thread_id: step1ThreadId.value,
       content_text: content,
@@ -1153,7 +1152,6 @@ async function submitStep2Export(downloadAfter = true) {
       ? { ...step2ExportFormatOptions.value }
       : null
     const response = await exportStep2(projectId.value, {
-      user_id: 'demo-user-id',
       project_name: getGlobalProjectName(),
       thread_id: step2ThreadId.value,
       content_text: content,
@@ -1274,7 +1272,6 @@ async function saveCurrentStep() {
         saving.value = true
         try {
           await createFileRecord(projectId.value, {
-            user_id: 'demo-user-id',
             project_name: projectName.value,
             file_name: `${projectName.value || `项目 ${projectId.value}`} Step1 草稿`,
             file_type: 'draft-json',

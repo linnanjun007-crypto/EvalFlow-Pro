@@ -176,3 +176,17 @@ export async function deleteKb(kbId: string) {
   const { data } = await api.delete(`/admin/kbs/${kbId}`)
   return data
 }
+
+export interface DashboardStats {
+  users: { total: number; active: number }
+  projects: number
+  llm_calls: number
+  total_tokens: number
+  tasks: { total: number; failed: number; failure_rate: number }
+  recent_events: ChangeLogRecord[]
+}
+
+export async function getDashboardStats() {
+  const { data } = await api.get<DashboardStats>('/admin/dashboard/stats')
+  return data
+}

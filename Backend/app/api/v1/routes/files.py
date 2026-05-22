@@ -7,6 +7,7 @@ from fastapi import APIRouter, Body, Depends, File, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user_id
 from app.core.errors import not_found
 from app.db.session import get_db
 from app.services.file_service import FileService
@@ -15,7 +16,6 @@ router = APIRouter()
 
 
 class FileCreateRequest(BaseModel):
-    user_id: str = Field(default="demo-user-id")
     project_name: str | None = None
     file_name: str = Field(default="unnamed", min_length=1)
     file_type: str = Field(default="unknown", min_length=1)
@@ -35,11 +35,12 @@ def get_file_service(db: Session = Depends(get_db)) -> FileService:
 def create_file_record(
     project_id: str,
     payload: FileCreateRequest = Body(...),
+    user_id: str = Depends(get_current_user_id),
     service: FileService = Depends(get_file_service),
 ) -> dict[str, object]:
     return service.create_file_record(
         project_id=project_id,
-        user_id=payload.user_id,
+        user_id=user_id,
         file_name=payload.file_name,
         file_type=payload.file_type,
         storage_key=payload.storage_key,
@@ -55,8 +56,8 @@ def create_file_record(
 @router.post("/{project_id}/upload")
 async def upload_file(
     project_id: str,
-    user_id: str = "demo-user-id",
     upload: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
     service: FileService = Depends(get_file_service),
 ) -> dict[str, object]:
     safe_name = Path(upload.filename or "unnamed").name

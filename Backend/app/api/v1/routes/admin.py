@@ -2,12 +2,18 @@ from typing import Literal
 
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_actor_user_id
 from app.core.errors import bad_request, not_found
 from app.db.session import get_db
 from app.integrations.agent_runner import AgentRunner
+from app.models.audit_log import AuditLog
+from app.models.llm_call import LlmCall
+from app.models.project import Project
+from app.models.task_job import TaskJob
+from app.models.user import User
 from app.services.admin_service import AdminService
 from app.services.audit_service import AuditService
 
@@ -67,6 +73,31 @@ def get_admin_service(db: Session = Depends(get_db)) -> AdminService:
 
 def get_audit_service(db: Session = Depends(get_db)) -> AuditService:
     return AuditService(db)
+
+
+@router.get("/dashboard/stats")
+def dashboard_stats(db: Session = Depends(get_db)) -> dict[str, object]:
+    """管理端仪表盘 KPI 数据。"""
+    total_users = db.scalar(select(func.count(User.id))) or 0
+    active_users = db.scalar(select(func.count(User.id)).where(User.status == "active")) or 0
+    total_projects = db.scalar(select(func.count(Project.id))) or 0
+    total_llm_calls = db.scalar(select(func.count(LlmCall.id))) or 0
+    total_tokens = db.scalar(select(func.coalesce(func.sum(LlmCall.total_tokens), 0))) or 0
+    total_tasks = db.scalar(select(func.count(TaskJob.id))) or 0
+    failed_tasks = db.scalar(select(func.count(TaskJob.id)).where(TaskJob.status == "failed")) or 0
+    failure_rate = round((failed_tasks / total_tasks) * 100, 2) if total_tasks else 0.0
+
+    audit_svc = AuditService(db)
+    recent_events = audit_svc.list_logs(limit=5)
+
+    return {
+        "users": {"total": int(total_users), "active": int(active_users)},
+        "projects": int(total_projects),
+        "llm_calls": int(total_llm_calls),
+        "total_tokens": int(total_tokens),
+        "tasks": {"total": int(total_tasks), "failed": int(failed_tasks), "failure_rate": failure_rate},
+        "recent_events": recent_events,
+    }
 
 
 @router.get("/steps")

@@ -5,9 +5,10 @@ from threading import Event
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
+from app.core.deps import get_current_user_id
 from app.db.session import SessionLocal
 from app.integrations.agent_runner import AgentRunner
 from app.models.file import File
@@ -192,14 +193,13 @@ def cancel_agent_run(run_id: str) -> dict[str, Any]:
 
 
 @router.post('/run')
-async def run_agent(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+async def run_agent(payload: dict[str, Any] = Body(...), user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
     role = str(payload.get('workflow_role') or payload.get('role') or 'client')
     step_code = str(payload.get('step_code') or 'step1')
     context = dict(payload.get('context') or {})
     body = dict(payload.get('payload') or {})
     context = _apply_active_model_config(context, body)
     project_id = str(body.get('project_id') or context.get('project_id') or '')
-    user_id = str(body.get('user_id') or context.get('user_id') or 'demo-user-id')
     memory_scope = str(context.get('memory_scope') or 'short_term')
 
     is_admin_workflow = role in {'admin', 'manager', 'admin_graphs'}

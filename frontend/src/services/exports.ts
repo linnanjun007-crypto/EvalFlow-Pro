@@ -151,3 +151,18 @@ export async function downloadExportFile(downloadUrl: string, fileName: string) 
   await assertDocxBlob(blob)
   triggerBrowserDownload(blob, fileName)
 }
+
+export interface GenericStepPdfRequest {
+  project_name: string
+  content_text: string
+  custom_title?: string | null
+  project_id?: string | null
+  save_to_database?: boolean
+}
+
+export async function exportStepPdf(stepCode: string, payload: GenericStepPdfRequest) {
+  const response = await api.post(`/exports/${stepCode}/pdf`, payload, { responseType: 'blob' })
+  const blob = response.data as Blob
+  const fileName = `${payload.project_name || stepCode}_${stepCode}.pdf`
+  triggerBrowserDownload(blob, fileName)
+}

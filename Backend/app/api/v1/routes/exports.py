@@ -14,10 +14,11 @@ from xml.sax.saxutils import escape
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.core.deps import get_current_user_id
 from app.db.session import SessionLocal
 from app.services.file_service import FileService
 
@@ -25,7 +26,6 @@ router = APIRouter()
 
 
 class Step1ExportRequest(BaseModel):
-    user_id: str = Field(default="demo-user-id")
     project_name: str = Field(default="")
     thread_id: str = Field(default="")
     content_text: str = Field(default="", min_length=1)
@@ -48,7 +48,6 @@ class Step2FormatOptions(BaseModel):
 
 
 class Step2ExportRequest(BaseModel):
-    user_id: str = Field(default="demo-user-id")
     project_name: str = Field(default="")
     thread_id: str = Field(default="")
     content_text: str = Field(default="", min_length=1)
@@ -358,7 +357,7 @@ def _write_step2_docx(
 
 
 @router.post('/step1/{project_id}')
-def export_step1(project_id: str, payload: Step1ExportRequest = Body(...)) -> dict[str, Any]:
+def export_step1(project_id: str, payload: Step1ExportRequest = Body(...), user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
     content = payload.content_text.strip()
     if not content:
         raise HTTPException(status_code=400, detail='content_text is required')
@@ -394,7 +393,7 @@ def export_step1(project_id: str, payload: Step1ExportRequest = Body(...)) -> di
             service = FileService(db)
             file_record = service.create_file_record(
                 project_id=project_id,
-                user_id=payload.user_id,
+                user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
                 file_type='docx',
@@ -417,7 +416,7 @@ def export_step1(project_id: str, payload: Step1ExportRequest = Body(...)) -> di
 
 
 @router.post('/step2/{project_id}')
-def export_step2(project_id: str, payload: Step2ExportRequest = Body(...)) -> dict[str, Any]:
+def export_step2(project_id: str, payload: Step2ExportRequest = Body(...), user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
     content = payload.content_text.strip()
     if not content:
         raise HTTPException(status_code=400, detail='content_text is required')
@@ -467,7 +466,7 @@ def export_step2(project_id: str, payload: Step2ExportRequest = Body(...)) -> di
             service = FileService(db)
             file_record = service.create_file_record(
                 project_id=project_id,
-                user_id=payload.user_id,
+                user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
                 file_type='docx',
@@ -518,7 +517,6 @@ class GenericStepExportRequest(BaseModel):
     content_text: str = Field(default='', min_length=1)
     export_style: str = Field(default='classic')
     custom_title: str | None = None
-    user_id: str = Field(default='demo-user-id')
     project_id: str | None = None
     save_to_database: bool = Field(default=True)
 
@@ -628,7 +626,7 @@ def _build_generic_docx(
 
 
 @router.post('/{step_code}/word')
-def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(...)) -> StreamingResponse:
+def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(...), user_id: str = Depends(get_current_user_id)) -> StreamingResponse:
     code = step_code.lower().strip()
     if not re.match(r'^step([3-9]|1[0-4])$', code):
         raise HTTPException(status_code=400, detail='step_code 必须是 step3~step14（step1/step2 请使用专用导出接口）')
@@ -679,7 +677,7 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
         with SessionLocal() as db:
             FileService(db).create_file_record(
                 project_id=project_id,
-                user_id=payload.user_id,
+                user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
                 file_type='docx',
@@ -692,5 +690,127 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
     return StreamingResponse(
         io.BytesIO(docx_bytes),
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        headers={'Content-Disposition': _attachment_disposition(filename)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PDF 导出（通用 step3~step14）
+# ---------------------------------------------------------------------------
+
+def _build_generic_pdf(
+    *,
+    title: str,
+    content: str,
+    project_name: str,
+    step_code: str,
+) -> bytes:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=2 * cm, bottomMargin=2 * cm)
+    styles = getSampleStyleSheet()
+
+    font_name = 'Helvetica'
+    try:
+        import platform
+        if platform.system() == 'Windows':
+            font_path = 'C:/Windows/Fonts/msyh.ttc'
+            pdfmetrics.registerFont(TTFont('MSYH', font_path, subfontIndex=0))
+            font_name = 'MSYH'
+    except Exception:
+        pass
+
+    title_style = ParagraphStyle('PDFTitle', parent=styles['Title'], fontName=font_name, fontSize=18, leading=24, spaceAfter=12)
+    body_style = ParagraphStyle('PDFBody', parent=styles['Normal'], fontName=font_name, fontSize=11, leading=16, spaceAfter=6)
+    heading_style = ParagraphStyle('PDFHeading', parent=styles['Heading2'], fontName=font_name, fontSize=14, leading=18, spaceAfter=8, spaceBefore=12)
+
+    elements = []
+    elements.append(Paragraph(escape(title), title_style))
+    elements.append(Paragraph(f'{escape(project_name)} · {step_code}', body_style))
+    elements.append(Spacer(1, 0.5 * cm))
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            elements.append(Spacer(1, 0.3 * cm))
+            continue
+        if line.startswith(('# ', '## ', '### ')) or re.match(r'^(一|二|三|四|五|六|七|八|九|十)[、.]', line):
+            clean = re.sub(r'^#{1,3}\s*', '', line)
+            elements.append(Paragraph(escape(clean), heading_style))
+        else:
+            elements.append(Paragraph(escape(line), body_style))
+
+    doc.build(elements)
+    return buffer.getvalue()
+
+
+@router.post('/{step_code}/pdf')
+def export_step_pdf(step_code: str, payload: GenericStepExportRequest = Body(...), user_id: str = Depends(get_current_user_id)) -> StreamingResponse:
+    code = step_code.lower().strip()
+    if not re.match(r'^step([3-9]|1[0-4])$', code):
+        raise HTTPException(status_code=400, detail='step_code 必须是 step3~step14')
+
+    content = payload.content_text.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail='content_text is required')
+    placeholder_values = {'最终版本内容将在这里编辑。', '最后版本内容将在这里编辑。'}
+    if content in placeholder_values or len(content) < 10:
+        raise HTTPException(status_code=400, detail='当前成品内容为空或仍为占位文本，请先生成 / 编辑后再导出')
+
+    project_name = payload.project_name.strip() or '未命名项目'
+    title = (
+        payload.custom_title.strip()
+        if payload.custom_title and payload.custom_title.strip()
+        else _step_default_title(code)
+    )
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'{_safe_filename(project_name)}_{code}_{timestamp}.pdf'
+
+    pdf_bytes = _build_generic_pdf(
+        title=title,
+        content=content,
+        project_name=project_name,
+        step_code=code,
+    )
+
+    project_id = (payload.project_id or '').strip()
+    if payload.save_to_database and project_id:
+        export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
+        export_dir.mkdir(parents=True, exist_ok=True)
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        export_path.write_bytes(pdf_bytes)
+
+        metadata = {
+            'project_id': project_id,
+            'project_name': project_name,
+            'step_code': code,
+            'export_style': 'pdf',
+            'export_filename': filename,
+            'storage_key': str(export_path),
+            'exported_at': datetime.utcnow().isoformat(),
+        }
+        with SessionLocal() as db:
+            FileService(db).create_file_record(
+                project_id=project_id,
+                user_id=user_id,
+                project_name=project_name,
+                file_name=filename,
+                file_type='pdf',
+                storage_key=str(export_path),
+                source_type=f'{code}_export_pdf',
+                file_size=len(pdf_bytes),
+                metadata_json=json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type='application/pdf',
         headers={'Content-Disposition': _attachment_disposition(filename)},
     )

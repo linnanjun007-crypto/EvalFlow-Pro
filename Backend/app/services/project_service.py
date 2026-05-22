@@ -13,7 +13,7 @@ class ProjectService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create_project(self, name: str, description: str | None = None, user_id: str = "demo-user-id") -> dict[str, Any]:
+    def create_project(self, *, user_id: str, name: str, description: str | None = None) -> dict[str, Any]:
         project = Project(
             id=str(uuid4()),
             user_id=user_id,
@@ -26,11 +26,11 @@ class ProjectService:
         self.db.refresh(project)
         return self._to_dict(project)
 
-    def list_projects(self, user_id: str = "demo-user-id") -> list[dict[str, Any]]:
+    def list_projects(self, *, user_id: str) -> list[dict[str, Any]]:
         items = self.db.scalars(select(Project).where(Project.user_id == user_id)).all()
         return [self._to_dict(item) for item in items]
 
-    def get_project(self, project_id: str, user_id: str = "demo-user-id") -> dict[str, Any]:
+    def get_project(self, project_id: str, *, user_id: str) -> dict[str, Any]:
         item = self.db.scalar(select(Project).where(Project.id == project_id, Project.user_id == user_id))
         if not item:
             raise ValueError("项目不存在")
@@ -39,7 +39,8 @@ class ProjectService:
     def update_project(
         self,
         project_id: str,
-        user_id: str = "demo-user-id",
+        *,
+        user_id: str,
         name: str | None = None,
         description: str | None = None,
         status: str | None = None,
@@ -57,7 +58,7 @@ class ProjectService:
         self.db.refresh(item)
         return self._to_dict(item)
 
-    def delete_project(self, project_id: str, user_id: str = "demo-user-id") -> None:
+    def delete_project(self, project_id: str, *, user_id: str) -> None:
         item = self.db.scalar(select(Project).where(Project.id == project_id, Project.user_id == user_id))
         if not item:
             raise ValueError("项目不存在")

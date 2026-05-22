@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user_id
 from app.core.errors import bad_request
 from app.db.session import get_db
 from app.schemas.step import StepGenerateRequest, StepGenerateResponse, StepResultResponse
@@ -33,19 +34,21 @@ def _serialize_content_json(value: Any) -> str:
 def generate_step(
     step_code: str,
     payload: StepGenerateRequest,
+    user_id: str = Depends(get_current_user_id),
     service: StepService = Depends(get_step_service),
 ) -> dict[str, str | None]:
     try:
         merged_payload = (payload.payload or {}) | {
             "review_mode": payload.review_mode,
             "review_feedback": payload.review_feedback,
+            "user_id": user_id,
         }
         result = service.generate_step(
             project_id=payload.project_id,
             step_code=step_code,
             role=payload.workflow_role,
             payload=merged_payload,
-            context={"project_id": payload.project_id, "workflow_role": payload.workflow_role},
+            context={"project_id": payload.project_id, "workflow_role": payload.workflow_role, "user_id": user_id},
         )
         return {
             "task_id": result["task_id"],

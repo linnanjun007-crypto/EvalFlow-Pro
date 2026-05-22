@@ -46,11 +46,10 @@ export async function createFileRecord(projectId: string, payload: FileCreateReq
   return data
 }
 
-export async function uploadProjectFile(projectId: string, file: File, userId = 'demo-user-id') {
+export async function uploadProjectFile(projectId: string, file: File) {
   const form = new FormData()
   form.append('upload', file)
   const { data } = await api.post<FileRecord>(`/files/${projectId}/upload`, form, {
-    params: { user_id: userId },
     headers: { 'Content-Type': 'multipart/form-data' },
   })
   return data
