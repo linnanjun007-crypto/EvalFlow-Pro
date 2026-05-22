@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Language
+
+**回答问题一定要用中文回答。** All responses to the user must be in Chinese (Simplified). This applies to explanations, summaries, status updates, and any other user-facing text. Code, identifiers, and file content follow the conventions of the surrounding code.
+
 ## Project Overview
 
 **EvalFlow Pro** (云海睿评) is a web system for generating AI-assisted performance evaluation reports. The core workflow is: user login → create project → upload materials → execute step-by-step workflows → generate content → support multi-model comparison, human review, version history, and export to Word/PDF. An admin console allows managing prompts, knowledge bases, and model configurations.
