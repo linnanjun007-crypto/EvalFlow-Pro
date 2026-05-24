@@ -78,6 +78,7 @@ lerna-debug.log*
 
 # ====== Runtime data ======
 Backend/storage/projects/
+Backend/storage/kbs/
 Backend/data/uploads/
 Backend/data/outputs/
 

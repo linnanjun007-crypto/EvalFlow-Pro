@@ -289,6 +289,21 @@ def _admin_prompt_and_kb(state: Step3State, context: dict[str, Any]) -> tuple[st
         or context.get("knowledge_stub")
         or ""
     ).strip()
+    user_kb = ""
+    project_id = str(context.get("project_id") or "")
+    project_name = str(state.get("project_name") or "")
+    if project_id:
+        try:
+            from ._llm import fetch_user_kb_context_sync
+            user_kb = fetch_user_kb_context_sync(
+                project_id=project_id,
+                query=f"{project_name} 指标体系 绩效指标",
+                step_code="step3",
+            )
+        except Exception:
+            user_kb = ""
+    if user_kb:
+        admin_kb = f"{admin_kb}\n\n{user_kb}".strip() if admin_kb else user_kb
     return admin_prompt, admin_kb
 
 

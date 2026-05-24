@@ -123,9 +123,10 @@ def _build_work_prompt(
     score_md: str,
     admin_prompt: str,
     admin_kb: str,
+    user_kb_context: str = "",
     review_feedback: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     feedback_block = (
         f"\n【人工反馈意见（请按此调整本次输出）】\n{review_feedback.strip()}\n"
         if review_feedback.strip()
@@ -271,6 +272,12 @@ def generate_work(state: Step13State, runtime: Any = None) -> Step13State:
     score_md = str(state.get("final_score_sheet_markdown") or "")
     admin_prompt = read_admin_prompt(context, dict(state))
     admin_kb = read_admin_kb(context, dict(state))
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 评价结论 工作底稿",
+        step_code="step13",
+    )
     review_feedback = (state.get("review_feedback") or "").strip()
 
     prompt = _build_work_prompt(
@@ -281,6 +288,7 @@ def generate_work(state: Step13State, runtime: Any = None) -> Step13State:
         score_md=score_md,
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
+        user_kb_context=user_kb_context,
         review_feedback=review_feedback,
     )
 

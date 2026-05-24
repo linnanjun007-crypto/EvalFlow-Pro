@@ -95,6 +95,7 @@ class Step1State(TypedDict, total=False):
     export_style: Literal["classic", "custom"]
     export_filename: str
     export_payload: str
+    structured_analysis: dict[str, Any]
     messages: Annotated[list[BaseMessage], operator.add]
     status: str
     error: str
@@ -127,6 +128,7 @@ class Step1Context(TypedDict, total=False):
     enable_multi_model: bool
     output_dir: str
     chat_mode: bool
+    cancel_event: Any
 
 
 @dataclass(slots=True)
@@ -235,6 +237,12 @@ class DocumentProcessor:
 processor = DocumentProcessor()
 
 
+def _ensure_not_cancelled(context: dict[str, Any]) -> None:
+    event = context.get("cancel_event")
+    if event is not None and hasattr(event, "is_set") and event.is_set():
+        raise RuntimeError("agent run cancelled")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace('+00:00', 'Z')
 
@@ -254,6 +262,90 @@ def _build_manifest_title(project_name: str) -> str:
     return f"{project_name}项目资料清单"
 
 
+# Step 联动映射：文件类型/关键词 → 后续步骤用途
+STEP_LINKAGE_MAP: dict[str, list[str]] = {
+    "预算": ["Step 4（预算对比分析）", "Step 6（资金绩效评分）"],
+    "决算": ["Step 4（预算对比分析）", "Step 6（资金绩效评分）"],
+    "资金": ["Step 4（预算对比分析）", "Step 6（资金绩效评分）"],
+    "合同": ["Step 5（合规性审查）", "Step 7（项目管理评分）"],
+    "招标": ["Step 5（合规性审查）"],
+    "采购": ["Step 5（合规性审查）"],
+    "验收": ["Step 8（产出评分）", "Step 10（效果评分）"],
+    "审计": ["Step 5（合规性审查）", "Step 9（综合评分汇总）"],
+    "绩效": ["Step 3（指标体系构建）", "Step 9（综合评分汇总）"],
+    "指标": ["Step 3（指标体系构建）"],
+    "方案": ["Step 2（核心内容提取）", "Step 7（项目管理评分）"],
+    "实施": ["Step 2（核心内容提取）", "Step 7（项目管理评分）"],
+    "报告": ["Step 2（核心内容提取）", "Step 14（终稿报告生成）"],
+    "通知": ["Step 2（核心内容提取）"],
+    "制度": ["Step 5（合规性审查）", "Step 7（项目管理评分）"],
+    "政策": ["Step 2（核心内容提取）", "Step 5（合规性审查）"],
+    "照片": ["Step 8（产出评分）", "Step 10（效果评分）"],
+    "图片": ["Step 8（产出评分）", "Step 10（效果评分）"],
+    "发票": ["Step 4（预算对比分析）", "Step 6（资金绩效评分）"],
+    "支出": ["Step 4（预算对比分析）", "Step 6（资金绩效评分）"],
+}
+
+# 审计/评价常见必备材料清单（用于 Gap Analysis）
+# 每条 = (材料名称, [识别关键词列表])
+REQUIRED_MATERIALS: list[tuple[str, list[str]]] = [
+    ("项目立项文件（批复/通知）", ["立项", "批复", "通知", "批文"]),
+    ("项目实施方案", ["实施方案", "工作方案", "建设方案"]),
+    ("预算批复/资金拨付文件", ["预算", "拨付", "资金计划"]),
+    ("资金支出明细（含发票/凭证）", ["支出", "发票", "凭证", "决算"]),
+    ("合同/协议", ["合同", "协议"]),
+    ("验收报告/完工证明", ["验收", "完工", "竣工"]),
+    ("绩效目标申报表", ["绩效目标", "目标申报", "申报表"]),
+    ("绩效自评报告", ["自评", "绩效报告", "评价报告"]),
+    ("审计报告", ["审计"]),
+    ("受益群体反馈/调查数据", ["反馈", "问卷", "调查", "受益", "满意度"]),
+]
+
+
+def _extract_key_numbers(summary: str) -> list[tuple[str, str]]:
+    """从文本摘要中提取数字型关键信息（金额、人数、面积等）。"""
+    patterns = [
+        (r"(\d[\d,]*\.?\d*)\s*万?元", "金额"),
+        (r"(\d[\d,]*\.?\d*)\s*亿", "金额（亿）"),
+        (r"(\d[\d,]*)\s*人", "人数"),
+        (r"(\d[\d,]*\.?\d*)\s*(?:平方米|㎡|平米|亩|公顷|万亩)", "面积"),
+        (r"(\d[\d,]*\.?\d*)\s*(?:公里|km|千米)", "距离"),
+        (r"(\d[\d,]*)\s*(?:个|项|件|批|台|套|座|栋|处|条)", "数量"),
+        (r"(\d{4})\s*年", "年份"),
+    ]
+    results: list[tuple[str, str]] = []
+    seen_values: set[str] = set()
+    for pattern, label in patterns:
+        for match in re.finditer(pattern, summary):
+            full_match = match.group(0).strip()
+            if full_match not in seen_values:
+                seen_values.add(full_match)
+                results.append((label, full_match))
+    return results
+
+
+def _infer_step_linkage(file_name: str, summary: str) -> list[str]:
+    """根据文件名和摘要推断该文件将用于哪些后续步骤。"""
+    combined = f"{file_name} {summary}".lower()
+    linked_steps: set[str] = set()
+    for keyword, steps in STEP_LINKAGE_MAP.items():
+        if keyword in combined:
+            linked_steps.update(steps)
+    if not linked_steps:
+        linked_steps.add("Step 2（核心内容提取）")
+    return sorted(linked_steps)
+
+
+def _build_gap_analysis(metadata: list[DocumentItem]) -> list[str]:
+    """基于已有文件，分析还缺哪些必备材料。"""
+    all_text = " ".join(f"{item['name']} {item['content_summary']}" for item in metadata)
+    missing: list[str] = []
+    for material, keywords in REQUIRED_MATERIALS:
+        if not any(kw in all_text for kw in keywords):
+            missing.append(material)
+    return missing
+
+
 def _render_manifest(metadata: list[DocumentItem], project_name: str) -> str:
     lines = [
         f"《{_build_manifest_title(project_name)}》",
@@ -261,17 +353,47 @@ def _render_manifest(metadata: list[DocumentItem], project_name: str) -> str:
         f"项目名称：{project_name}",
         f"生成时间：{_now_iso()}",
         "",
-        "一、资料清单",
+        "一、资料清单（含关键数字与 Step 联动）",
+        "",
+        "| 编号 | 文件名 | 类型 | 规模 | 内容摘要 | 关键数字 KV | Step 联动 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for idx, item in enumerate(metadata, start=1):
+        summary = item.get("content_summary", "")
+        kv_pairs = _extract_key_numbers(summary)
+        kv_text = "；".join(f"{label}={value}" for label, value in kv_pairs[:6]) or "（未提取到数字）"
+        linkage = "、".join(_infer_step_linkage(item.get("name", ""), summary))
+        clean_summary = summary.replace("|", "／").replace("\n", " ")[:120]
         lines.append(
-            f"{idx}. {item['name']} | 类型：{item['type']} | 规模：{item['page_count']} | 摘要：{item['content_summary']}"
+            f"| {idx} | {item['name']} | {item['type']} | {item['page_count']} | {clean_summary} | {kv_text} | {linkage} |"
         )
+
+    lines.extend(["", "二、关键数字汇总（Key-Value）"])
+    aggregated: list[tuple[str, str, str]] = []
+    for item in metadata:
+        for label, value in _extract_key_numbers(item.get("content_summary", "")):
+            aggregated.append((item.get("name", ""), label, value))
+    if aggregated:
+        for source, label, value in aggregated:
+            lines.append(f"- {label}：{value}（来源：{source}）")
+    else:
+        lines.append("- 未从已上传资料中提取到可量化的金额、人数、面积等数字。")
+
+    lines.extend(["", "三、Gap Analysis（差距分析）"])
+    missing = _build_gap_analysis(metadata)
+    if missing:
+        lines.append("以下必备材料尚未在已上传资料中识别到，建议补齐以满足审核要求：")
+        for material in missing:
+            lines.append(f"- [缺] {material}")
+    else:
+        lines.append("- 已覆盖常见必备材料类别，无明显缺口。")
+
     lines.extend(
         [
             "",
-            "二、备注",
-            "本清单由系统自动解析资料并整理，用户可在成品区直接编辑或继续与大模型对话完善。",
+            "四、备注",
+            "本清单由系统自动解析资料并整理，关键数字基于正则提取，Step 联动基于关键词匹配。",
+            "用户可在成品区直接编辑或继续与大模型对话完善。",
         ]
     )
     return "\n".join(lines)
@@ -283,21 +405,66 @@ def _build_llm_prompt(
     *,
     admin_system_prompt: str = "",
     admin_knowledge_base: str = "",
+    user_kb_context: str = "",
 ) -> str:
+    pre_extracted_numbers: list[str] = []
+    for item in metadata:
+        kv = _extract_key_numbers(item.get("content_summary", ""))
+        if kv:
+            pre_extracted_numbers.append(
+                f"- {item.get('name', '')}: " + "; ".join(f"{label}={value}" for label, value in kv)
+            )
+    pre_extracted_text = "\n".join(pre_extracted_numbers) if pre_extracted_numbers else "（未自动识别到数字，请你从原文摘要中再次扫描）"
+
+    rule_based_gap = _build_gap_analysis(metadata)
+    gap_hint = "、".join(rule_based_gap) if rule_based_gap else "（系统初判未发现明显缺口，请你结合通知/政策原文复核）"
+
     task_lines = [
         "请根据用户上传的资料元数据生成《项目资料清单》。",
-        "要求：",
-        "1. 输出中文；",
-        "2. 按资料编号、文件名、类型、页数/规模、内容摘要、用途建议整理；",
-        "3. 标注需要人工复核的资料；",
-        "4. 末尾给出后续 Step2 生成有效项目资料时的资料使用建议；",
+        "",
+        "【硬性输出结构（必须按本结构输出，不允许只写摘要）】",
+        "",
+        "一、资料清单（Markdown 表格）",
+        "  表头固定为：| 编号 | 文件名 | 类型 | 规模 | 内容摘要 | 关键数字 KV | 用于 Step |",
+        "  - 「关键数字 KV」列：把该文件中提到的金额、人数、面积、时间节点等关键数字单独列成 Key-Value 对，",
+        "    例如：经费=100万元；受益学生=5000人；覆盖面积=200亩；起止时间=2024-01~2024-12。多个 KV 用「；」分隔。",
+        "  - 「用于 Step」列：必须明确标注该文件将用于后续的哪些步骤（用 Step 2 ~ Step 14 中的具体编号）。",
+        "    可选示例：Step 2（核心内容提取）、Step 3（指标体系构建）、Step 4（预算对比分析）、Step 5（合规性审查）、",
+        "    Step 6（资金绩效评分）、Step 7（项目管理评分）、Step 8（产出评分）、Step 9（综合评分汇总）、",
+        "    Step 10（效果评分）、Step 14（终稿报告生成）。",
+        "    例如「本文件将用于 Step 4 的预算-决算自动比对」「本文件将用于 Step 5 的合规性审查」。",
+        "",
+        "二、关键数字汇总（Key-Value 列表）",
+        "  把所有文件中的数字按类别（金额 / 人数 / 面积 / 时间 / 数量 / 距离）汇总，每条标注来源文件名。",
+        "  格式：- 金额：100 万元（来源：xxx 通知.docx）",
+        "  禁止只写「金额若干」之类模糊表述，必须保留原文具体数值。",
+        "",
+        "三、Gap Analysis（差距分析）",
+        "  基于本批资料，明确指出还缺哪些证明材料才能通过绩效评价/审计审核。",
+        "  每条缺口写成：- [缺] 材料名称 —— 用途说明（为什么需要补这份材料）。",
+        "  必须覆盖以下维度：立项依据、实施方案、资金/预算、合同/招投标、验收/产出、绩效目标与自评、审计、受益群体反馈。",
+        "  系统初判可能缺失：" + gap_hint,
+        "",
+        "四、Step 联动建议",
+        "  汇总说明本批资料将驱动后续哪几个 Step 的自动比对/评分，并标注对应文件。",
+        "",
+        "【硬性约束】",
+        "1. 全文中文；",
+        "2. 数字必须从摘要中真实提取，禁止编造；如摘要中没有，写「（原文未提及）」；",
+        "3. 不要省略表格列；不要把「关键数字 KV」「用于 Step」合并成一句话散文；",
+        "4. 不要复述输入 JSON，要做结构化重写；",
         "5. 不要编造不存在的文件。",
+        "",
+        "【系统已自动预提取的数字（供你校验/补充）】",
+        pre_extracted_text,
     ]
     parts: list[str] = []
     if admin_system_prompt.strip():
         parts.extend(["【管理端 Prompt 配置】", admin_system_prompt.strip(), ""])
     if admin_knowledge_base.strip():
         parts.extend(["【管理端知识库】", admin_knowledge_base.strip(), ""])
+    if user_kb_context.strip():
+        parts.extend([user_kb_context.strip(), ""])
     parts.extend(task_lines)
     parts.extend(
         [
@@ -459,11 +626,27 @@ async def _generate_model_drafts_async(
     state = state or {}
     admin_system_prompt = str(state.get("admin_system_prompt") or context.get("admin_system_prompt") or "")
     admin_knowledge_base = str(state.get("admin_knowledge_base") or context.get("admin_knowledge_base") or "")
+
+    user_kb_ctx = ""
+    project_id = str(context.get("project_id") or "")
+    if project_id:
+        try:
+            from agent.user_graphs._kb_retrieval import retrieve_kb_context
+            user_kb_ctx = await retrieve_kb_context(
+                project_id=project_id,
+                query=f"{project_name} 项目资料清单 文件列表",
+                top_k=5,
+                step_code="step1",
+            )
+        except Exception:
+            user_kb_ctx = ""
+
     prompt = _build_llm_prompt(
         project_name,
         metadata,
         admin_system_prompt=admin_system_prompt,
         admin_knowledge_base=admin_knowledge_base,
+        user_kb_context=user_kb_ctx,
     )
     system_prompt = admin_system_prompt or "你是严谨的政务/财政绩效评价文档生成助手。"
     configured_models = _read_model_configs(context)
@@ -473,6 +656,8 @@ async def _generate_model_drafts_async(
 
     if not configured_models:
         raise RuntimeError("缺少客户端模型配置：model_configs/base_url/api_key/model_name 必填")
+
+    _ensure_not_cancelled(context)
 
     async def generate_one(config: dict[str, Any]) -> ModelComparison:
         model_name = str(config["model_name"])
@@ -666,6 +851,35 @@ def _compose_chat_reply(messages: list[BaseMessage], state: Step1State, context:
     return _call_chat_llm(messages, state, context)
 
 
+def _build_structured_analysis(metadata: list[DocumentItem]) -> dict[str, Any]:
+    """Build structured analysis data for frontend three-table rendering."""
+    key_metrics: list[dict[str, str]] = []
+    for item in metadata:
+        for label, value in _extract_key_numbers(item.get("content_summary", "")):
+            key_metrics.append({"label": label, "value": value, "source": item.get("name", "")})
+
+    gap_items: list[dict[str, str]] = []
+    all_text = " ".join(f"{item['name']} {item['content_summary']}" for item in metadata)
+    for material, keywords in REQUIRED_MATERIALS:
+        found = any(kw in all_text for kw in keywords)
+        gap_items.append({
+            "material": material,
+            "status": "success" if found else "error",
+            "note": "已识别到相关资料" if found else "未在已上传资料中识别到，建议补齐",
+        })
+
+    data_flow: list[dict[str, Any]] = []
+    for item in metadata:
+        linked = _infer_step_linkage(item.get("name", ""), item.get("content_summary", ""))
+        data_flow.append({
+            "file_name": item.get("name", ""),
+            "file_type": item.get("type", ""),
+            "target_steps": linked,
+        })
+
+    return {"key_metrics": key_metrics, "gap_analysis": gap_items, "data_flow": data_flow}
+
+
 def initialize_project(state: Step1State) -> Step1State:
     """Parse uploaded files and infer the project name."""
 
@@ -687,12 +901,14 @@ def initialize_project(state: Step1State) -> Step1State:
     metadata = [processor.parse(path) for path in file_paths]
     project_name = state.get("project_name") or _detect_project_name(metadata)
     fresh_manifest = _render_manifest(metadata, project_name)
+    structured = _build_structured_analysis(metadata)
 
     return {
         "project_name": project_name,
         "doc_metadata": metadata,
         "draft_manifest": fresh_manifest,
         "final_manifest": fresh_manifest,
+        "structured_analysis": structured,
         "review_round": 0,
         "review_feedback": "",
         "status": "initialized",
@@ -714,6 +930,7 @@ def build_manifest_draft(state: Step1State, runtime: Any) -> Step1State:
     metadata = state.get("doc_metadata", [])
     project_name = state.get("project_name", "未命名项目")
     context = getattr(runtime, "context", {}) or {}
+    _ensure_not_cancelled(context)
 
     multi_model_enabled = bool(context.get("enable_multi_model", False))
     models = list(context.get("compare_models", [])) or [context.get("model_name", "默认模型") or "默认模型"]
@@ -732,6 +949,7 @@ def build_manifest_draft(state: Step1State, runtime: Any) -> Step1State:
         return {
             "draft_manifest": fallback,
             "model_comparisons": [],
+            "structured_analysis": _build_structured_analysis(metadata),
             "export_filename": _build_export_filename(project_name, state.get("export_style", "classic")),
             "export_payload": fallback,
             "status": "model_failed_fallback_ready",
@@ -746,6 +964,7 @@ def build_manifest_draft(state: Step1State, runtime: Any) -> Step1State:
         "draft_manifest": draft_manifest,
         "final_manifest": draft_manifest,
         "model_comparisons": comparisons,
+        "structured_analysis": _build_structured_analysis(metadata),
         "export_filename": _build_export_filename(project_name, export_style),
         "export_payload": draft_manifest,
         "status": "draft_ready",
@@ -758,9 +977,9 @@ def build_manifest_draft(state: Step1State, runtime: Any) -> Step1State:
 def route_review_mode(state: Step1State) -> str:
     """Route to refinement or finish based on review mode."""
 
-    if state.get("review_mode") == "approve":
-        return "approve"
-    return "modify"
+    if state.get("review_mode") == "modify" and state.get("review_feedback", "").strip():
+        return "modify"
+    return "approve"
 
 
 def refine_manifest(state: Step1State) -> Step1State:
@@ -789,6 +1008,21 @@ def approve_manifest(state: Step1State) -> Step1State:
 
     if not final_manifest:
         final_manifest = _render_manifest(state.get("doc_metadata", []), project_name)
+
+    previous_status = str(state.get("status") or "")
+    previous_error = str(state.get("error") or "")
+    fallback_failed = previous_status.startswith("model_failed") or "模型调用失败" in previous_error or "Unauthorized" in previous_error
+
+    if fallback_failed:
+        return {
+            "final_manifest": final_manifest,
+            "export_payload": final_manifest,
+            "export_filename": state.get("export_filename") or _build_export_filename(project_name, state.get("export_style", "classic")),
+            "status": "model_failed_fallback_ready",
+            "error": previous_error or "模型调用失败，已回退到规则模板。请检查 API Key / Base URL / 模型名是否正确。",
+            "updated_at": _now_iso(),
+            "messages": [AIMessage(content=f"模型调用失败，当前展示的是规则模板回退结果，并非 LLM 真实输出。错误：{previous_error}")],
+        }
 
     return {
         "final_manifest": final_manifest,

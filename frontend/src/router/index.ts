@@ -5,12 +5,13 @@ import AppShellPage from '../pages/app/AppShellPage.vue'
 import ProjectListPage from '../pages/app/ProjectListPage.vue'
 import ProjectCreatePage from '../pages/app/ProjectCreatePage.vue'
 import ProjectOverviewPage from '../pages/app/ProjectOverviewPage.vue'
-import ProjectWorkflowPage from '../pages/app/ProjectWorkflowPage.vue'
+import WorkflowRouter from '../pages/app/WorkflowRouter.vue'
 import HistoryCenterPage from '../pages/app/HistoryCenterPage.vue'
 import UsagePage from '../pages/app/UsagePage.vue'
 import AccountPage from '../pages/app/AccountPage.vue'
 import DownloadsPage from '../pages/app/DownloadsPage.vue'
 import ConversationPage from '../pages/app/ConversationPage.vue'
+import PersonalKbPage from '../pages/app/PersonalKbPage.vue'
 
 import AdminShellPage from '../pages/admin/AdminShellPage.vue'
 import AdminDashboardPage from '../pages/admin/AdminDashboardPage.vue'
@@ -82,7 +83,8 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'projects/:projectId/workflow/:stepId',
         name: 'project-workflow',
-        component: ProjectWorkflowPage,
+        component: WorkflowRouter,
+        meta: { workflow: true },
       },
       {
         path: 'history',
@@ -108,6 +110,11 @@ const routes: RouteRecordRaw[] = [
         path: 'chat',
         name: 'chat',
         component: ConversationPage,
+      },
+      {
+        path: 'kbs',
+        name: 'personal-kbs',
+        component: PersonalKbPage,
       },
     ],
   },

@@ -149,9 +149,10 @@ def _build_problem_prompt(
     style: StyleMode,
     admin_prompt: str,
     admin_kb: str,
+    user_kb_context: str = "",
     review_feedback: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     feedback_block = (
         f"\n【人工反馈意见（请按此调整本次输出）】\n{review_feedback.strip()}\n"
         if review_feedback.strip()
@@ -367,6 +368,12 @@ def generate_problems(state: Step9State, runtime: Any = None) -> Step9State:
     style: StyleMode = state.get("style_mode") or "中立"
     admin_prompt = read_admin_prompt(context, dict(state))
     admin_kb = read_admin_kb(context, dict(state))
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 综合评分 问题分析",
+        step_code="step9",
+    )
     review_feedback = (state.get("review_feedback") or "").strip()
 
     prompt = _build_problem_prompt(
@@ -378,6 +385,7 @@ def generate_problems(state: Step9State, runtime: Any = None) -> Step9State:
         style=style,
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
+        user_kb_context=user_kb_context,
         review_feedback=review_feedback,
     )
 

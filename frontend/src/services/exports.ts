@@ -1,6 +1,8 @@
 import { api } from './api'
 import type { FileRecord } from './files'
 
+export type ExportFormat = 'markdown' | 'docx'
+
 export interface Step1ExportRequest {
   user_id?: string
   project_name: string
@@ -8,6 +10,7 @@ export interface Step1ExportRequest {
   content_text: string
   content_json?: string | null
   export_style: 'classic' | 'custom'
+  export_format?: ExportFormat
   custom_title?: string | null
   save_to_database?: boolean
   draft_payload?: Record<string, unknown> | null
@@ -43,6 +46,7 @@ export interface Step2ExportRequest {
   content_text: string
   content_json?: string | null
   export_style: 'classic' | 'custom'
+  export_format?: ExportFormat
   custom_title?: string | null
   save_to_database?: boolean
   draft_payload?: Record<string, unknown> | null
@@ -90,27 +94,36 @@ async function readBlobErrorMessage(blob: Blob) {
   }
 }
 
-function isDocxBlob(blob: Blob) {
-  return (
+function fileExtension(name: string): string {
+  const idx = name.lastIndexOf('.')
+  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : ''
+}
+
+async function assertExportBlob(blob: Blob, fileName: string) {
+  if (!(blob instanceof Blob) || blob.size === 0) {
+    throw new Error('下载失败，文件为空')
+  }
+  const ext = fileExtension(fileName)
+  if (ext === 'md' || ext === 'markdown' || ext === 'txt') {
+    if (blob.type.includes('json')) {
+      throw new Error(await readBlobErrorMessage(blob))
+    }
+    return
+  }
+  if (blob.size < 4) throw new Error('下载失败，文件为空')
+  const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer())
+  const isZipDocx = header[0] === 0x50 && header[1] === 0x4b
+  if (isZipDocx) return
+  if (blob.type.includes('json')) {
+    throw new Error(await readBlobErrorMessage(blob))
+  }
+  const looksDocx =
     blob.type.includes('wordprocessingml') ||
     blob.type.includes('officedocument') ||
     blob.type === 'application/octet-stream' ||
     blob.type === ''
-  )
-}
-
-async function assertDocxBlob(blob: Blob) {
-  if (!(blob instanceof Blob) || blob.size < 4) {
-    throw new Error('下载失败，文件为空')
-  }
-  const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer())
-  const isZipDocx = header[0] === 0x50 && header[1] === 0x4b
-  if (isZipDocx) return
-  if (blob.type.includes('json') || blob.type.includes('text')) {
-    throw new Error(await readBlobErrorMessage(blob))
-  }
-  if (!isDocxBlob(blob)) {
-    throw new Error('下载失败，返回内容不是有效的 Word 文档')
+  if (!looksDocx) {
+    throw new Error('下载失败，返回内容不是有效的导出文件')
   }
 }
 
@@ -132,6 +145,8 @@ export interface Step14ExportRequest {
   project_name: string
   content_text: string
   custom_title?: string | null
+  export_format?: ExportFormat
+  save_to_database?: boolean
 }
 
 export type Step14ExportResponse = Step1ExportResponse
@@ -143,12 +158,16 @@ export async function exportStep14Word(projectId: string, payload: Step14ExportR
 
 export async function downloadExportFile(downloadUrl: string, fileName: string) {
   const path = toExportDownloadPath(downloadUrl)
+  const ext = fileExtension(fileName)
+  const accept = ext === 'md' || ext === 'markdown' || ext === 'txt'
+    ? 'text/markdown, text/plain;q=0.9, */*;q=0.8'
+    : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document, */*;q=0.8'
   const response = await api.get(path, {
     responseType: 'blob',
-    headers: { Accept: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+    headers: { Accept: accept },
   })
   const blob = response.data as Blob
-  await assertDocxBlob(blob)
+  await assertExportBlob(blob, fileName)
   triggerBrowserDownload(blob, fileName)
 }
 

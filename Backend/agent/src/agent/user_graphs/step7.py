@@ -173,8 +173,9 @@ def _build_analysis_prompt(
     admin_prompt: str,
     admin_kb: str,
     review_feedback: str = "",
+    user_kb_context: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     indicator_blocks: list[str] = []
     for row in rows:
         rubric = row.get("rubric") or {}
@@ -416,6 +417,12 @@ def generate_analysis(state: Step7State, runtime: Any = None) -> Step7State:
     field_evidence = str(state.get("field_evidence") or "")
     admin_prompt = read_admin_prompt(context, dict(state))
     admin_kb = read_admin_kb(context, dict(state))
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 项目管理 实施方案",
+        step_code="step7",
+    )
     review_feedback = (state.get("review_feedback") or "").strip()
 
     prompt = _build_analysis_prompt(
@@ -426,6 +433,7 @@ def generate_analysis(state: Step7State, runtime: Any = None) -> Step7State:
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
         review_feedback=review_feedback,
+        user_kb_context=user_kb_context,
     )
 
     configs = filter_configs_by_compare_models(

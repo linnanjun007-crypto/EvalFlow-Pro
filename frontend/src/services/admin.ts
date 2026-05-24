@@ -4,10 +4,13 @@ export interface ModelRecord {
   id: string
   name: string
   model_id: string
-  api_key?: string | null
+  api_key_preview?: string
   base_url?: string | null
   enabled: boolean
   supports_vision: boolean
+  kind: 'chat' | 'embedding' | 'rerank'
+  dimensions?: number | null
+  is_default: boolean
 }
 
 export interface PromptRecord {
@@ -117,6 +120,11 @@ export async function createModel(payload: Record<string, unknown>) {
   return data
 }
 
+export async function updateModel(modelId: string, payload: Record<string, unknown>) {
+  const { data } = await api.patch(`/admin/models/${modelId}`, payload)
+  return data
+}
+
 export async function toggleModel(modelId: string, enabled: boolean) {
   const { data } = await api.patch(`/admin/models/${modelId}`, { enabled })
   return data
@@ -124,6 +132,11 @@ export async function toggleModel(modelId: string, enabled: boolean) {
 
 export async function deleteModel(modelId: string) {
   const { data } = await api.delete(`/admin/models/${modelId}`)
+  return data
+}
+
+export async function setDefaultModel(modelId: string) {
+  const { data } = await api.post(`/admin/models/${modelId}/set-default`)
   return data
 }
 

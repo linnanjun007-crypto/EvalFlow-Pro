@@ -305,26 +305,72 @@ class AdminService:
         items = self.db.scalars(select(ModelRegistry)).all()
         return [self._model_to_dict(item) for item in items]
 
-    def create_model(self, name: str, model_id: str, api_key: str | None = None, base_url: str | None = None, supports_vision: bool = False) -> dict[str, Any]:
+    def create_model(
+        self,
+        name: str,
+        model_id: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        supports_vision: bool = False,
+        kind: str = "chat",
+        dimensions: int | None = None,
+    ) -> dict[str, Any]:
+        normalized_kind = kind if kind in ("chat", "embedding", "rerank") else "chat"
+        # 如果同 kind 还没有任何模型，自动把这条设为默认
+        existing_count = self.db.scalar(
+            select(func.count(ModelRegistry.id)).where(ModelRegistry.kind == normalized_kind)
+        ) or 0
         item = ModelRegistry(
             id=str(uuid4()),
             name=name,
             model_id=model_id,
-            api_key=api_key,
-            base_url=base_url,
+            api_key=api_key or None,
+            base_url=base_url or None,
             enabled=True,
             supports_vision=supports_vision,
+            kind=normalized_kind,
+            dimensions=dimensions,
+            is_default=(existing_count == 0),
         )
         self.db.add(item)
         self.db.commit()
         self.db.refresh(item)
         return self._model_to_dict(item)
 
-    def toggle_model(self, model_id: str, enabled: bool) -> dict[str, Any]:
+    def set_default_model(self, model_id: str, actor_user_id: str | None = None) -> dict[str, Any]:
         item = self.db.scalar(select(ModelRegistry).where(ModelRegistry.id == model_id))
         if not item:
             raise ValueError("模型不存在")
-        item.enabled = enabled
+        self.db.query(ModelRegistry).filter(ModelRegistry.kind == item.kind).update({"is_default": False})
+        item.is_default = True
+        if actor_user_id:
+            self.audit.record(
+                actor_user_id=actor_user_id,
+                action="set_default",
+                target_type="model",
+                target_id=item.id,
+                after_data={"kind": item.kind, "model_id": item.model_id},
+            )
+        self.db.commit()
+        self.db.refresh(item)
+        return self._model_to_dict(item)
+
+    def toggle_model(self, model_id: str, enabled: bool) -> dict[str, Any]:
+        return self.update_model(model_id, {"enabled": enabled})
+
+    def update_model(self, model_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        item = self.db.scalar(select(ModelRegistry).where(ModelRegistry.id == model_id))
+        if not item:
+            raise ValueError("模型不存在")
+        allowed = {"enabled", "name", "model_id", "api_key", "base_url", "supports_vision", "kind", "dimensions"}
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if value is None:
+                continue
+            if key == "api_key" and not value:
+                continue
+            setattr(item, key, value)
         self.db.commit()
         self.db.refresh(item)
         return self._model_to_dict(item)
@@ -497,8 +543,27 @@ class AdminService:
     def _prompt_to_dict(self, item: PromptVersion) -> dict[str, Any]:
         return {"id": item.id, "step_code": item.step_code, "version": item.version, "title": item.title, "content": item.content, "is_active": item.is_active}
 
+    @staticmethod
+    def _mask_key(key: str | None) -> str:
+        if not key:
+            return ""
+        if len(key) <= 8:
+            return key[:2] + "****"
+        return key[:4] + "****" + key[-4:]
+
     def _model_to_dict(self, item: ModelRegistry) -> dict[str, Any]:
-        return {"id": item.id, "name": item.name, "model_id": item.model_id, "api_key": item.api_key, "base_url": item.base_url, "enabled": item.enabled, "supports_vision": item.supports_vision}
+        return {
+            "id": item.id,
+            "name": item.name,
+            "model_id": item.model_id,
+            "api_key_preview": self._mask_key(item.api_key),
+            "base_url": item.base_url,
+            "enabled": item.enabled,
+            "supports_vision": item.supports_vision,
+            "kind": item.kind,
+            "dimensions": item.dimensions,
+            "is_default": item.is_default,
+        }
 
     def _kb_to_dict(self, item: KbVersion) -> dict[str, Any]:
         return {"id": item.id, "step_code": item.step_code, "version": item.version, "name": item.name, "storage_ref": item.storage_ref, "is_active": item.is_active}

@@ -275,8 +275,14 @@ async def run_agent(payload: dict[str, Any] = Body(...), user_id: str = Depends(
         result = await run_in_threadpool(runner.run, role=role, step_code=step_code, payload=body, context=context)
         if cancel_event.is_set():
             raise HTTPException(status_code=499, detail='agent run cancelled')
+    except HTTPException:
+        raise
     except ModuleNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f'未找到对应的 agent graph: {role}/{step_code}') from exc
+    except Exception as exc:
+        if cancel_event.is_set() or 'cancelled' in str(exc).lower():
+            raise HTTPException(status_code=499, detail='agent run cancelled') from exc
+        raise
     finally:
         ACTIVE_RUNS.pop(run_id, None)
 

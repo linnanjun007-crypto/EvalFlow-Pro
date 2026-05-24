@@ -113,9 +113,10 @@ def _build_base_prompt(
     field_evidence: str,
     admin_prompt: str,
     admin_kb: str,
+    user_kb_context: str = "",
     review_feedback: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     feedback_block = (
         f"\n【人工反馈意见（请按此调整本次输出）】\n{review_feedback.strip()}\n"
         if review_feedback.strip()
@@ -245,6 +246,12 @@ def generate_base(state: Step12State, runtime: Any = None) -> Step12State:
     field_evidence = str(state.get("field_evidence") or "")
     admin_prompt = read_admin_prompt(context, dict(state))
     admin_kb = read_admin_kb(context, dict(state))
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 问题与建议",
+        step_code="step12",
+    )
     review_feedback = (state.get("review_feedback") or "").strip()
 
     prompt = _build_base_prompt(
@@ -253,6 +260,7 @@ def generate_base(state: Step12State, runtime: Any = None) -> Step12State:
         field_evidence=field_evidence,
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
+        user_kb_context=user_kb_context,
         review_feedback=review_feedback,
     )
 

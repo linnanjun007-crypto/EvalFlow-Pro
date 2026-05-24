@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '../../components/ef/PageHeader.vue'
+import ProjectKbBindingPanel from '../../components/ef/ProjectKbBindingPanel.vue'
 import { getProject, type ProjectResponse } from '../../services/projects'
 import { getWorkflowStatus, type WorkflowStatusResponse } from '../../services/steps'
 
@@ -79,6 +80,10 @@ onMounted(refresh)
           <p class="tip">{{ progressText }}</p>
           <el-button type="primary" @click="goWorkflow(Number((workflowStatus?.steps.find((item) => !item.done)?.step_code || 'step1').replace('step', ''))) ">继续下一步</el-button>
         </template>
+      </article>
+
+      <article class="ef-card block wide">
+        <ProjectKbBindingPanel :project-id="projectId" />
       </article>
 
       <article class="ef-card block wide">

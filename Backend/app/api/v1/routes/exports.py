@@ -31,6 +31,7 @@ class Step1ExportRequest(BaseModel):
     content_text: str = Field(default="", min_length=1)
     content_json: str | None = None
     export_style: str = Field(default="classic")
+    export_format: str = Field(default="markdown", description="markdown | docx")
     custom_title: str | None = None
     save_to_database: bool = Field(default=True)
     draft_payload: dict[str, Any] | None = None
@@ -53,6 +54,7 @@ class Step2ExportRequest(BaseModel):
     content_text: str = Field(default="", min_length=1)
     content_json: str | None = None
     export_style: str = Field(default="classic")
+    export_format: str = Field(default="markdown", description="markdown | docx")
     custom_title: str | None = None
     save_to_database: bool = Field(default=True)
     draft_payload: dict[str, Any] | None = None
@@ -63,6 +65,54 @@ class Step2ExportRequest(BaseModel):
 def _safe_filename(value: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', value).strip(' ._')
     return cleaned or '未命名项目'
+
+
+def _normalize_export_format(value: str | None) -> str:
+    if isinstance(value, str) and value.strip().lower() in {'markdown', 'md'}:
+        return 'markdown'
+    return 'docx'
+
+
+def _media_type_for(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix == '.md':
+        return 'text/markdown; charset=utf-8'
+    if suffix == '.pdf':
+        return 'application/pdf'
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+
+def _build_markdown_export(
+    *,
+    title: str,
+    content: str,
+    project_name: str,
+    doc_type: str,
+    export_style: str | None = None,
+    extra_meta: list[tuple[str, str]] | None = None,
+) -> str:
+    now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
+    style_label = ''
+    if export_style:
+        style_label = '经典排版' if export_style == 'classic' else '自定义排版'
+    meta_rows = [
+        ('项目名称', project_name),
+        ('文档类型', doc_type),
+    ]
+    if style_label:
+        meta_rows.append(('排版样式', style_label))
+    meta_rows.append(('导出时间', now))
+    if extra_meta:
+        meta_rows.extend([(k, v) for k, v in extra_meta if k and v])
+    header_lines = [f'# {title}', '']
+    header_lines.append('| 项目 | 内容 |')
+    header_lines.append('| --- | --- |')
+    for key, value in meta_rows:
+        safe_value = str(value).replace('|', '\\|').replace('\n', ' ')
+        header_lines.append(f'| {key} | {safe_value} |')
+    header_lines.extend(['', '---', ''])
+    body = content.strip() or '_（成品区暂无内容）_'
+    return '\n'.join(header_lines) + body + '\n'
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -364,16 +414,33 @@ def export_step1(project_id: str, payload: Step1ExportRequest = Body(...), user_
 
     project_name = payload.project_name.strip() or f'项目 {project_id}'
     style = payload.export_style if payload.export_style in {'classic', 'custom'} else 'classic'
+    export_format = _normalize_export_format(payload.export_format)
     style_label = '经典排版' if style == 'classic' else '自定义排版'
     title = payload.custom_title.strip() if payload.custom_title and payload.custom_title.strip() else f'{project_name}项目资料清单'
-    filename = f'{_safe_filename(project_name)}项目资料清单_{style_label}.docx'
-    export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
-    export_dir.mkdir(parents=True, exist_ok=True)
-    export_path = export_dir / f'{uuid4().hex}_{filename}'
     placeholder_values = {'最终版本内容将在这里编辑。', '最后版本内容将在这里编辑。'}
     if content in placeholder_values or len(content) < 10:
         raise HTTPException(status_code=400, detail='当前成品内容为空或仍为占位文本，请先生成/编辑 Step1 成果后再导出')
-    _write_docx(export_path, title, content, style, project_name)
+
+    export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    if export_format == 'markdown':
+        filename = f'{_safe_filename(project_name)}项目资料清单.md'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        md_text = _build_markdown_export(
+            title=title,
+            content=content,
+            project_name=project_name,
+            doc_type='项目资料清单',
+            export_style=style,
+        )
+        export_path.write_text(md_text, encoding='utf-8')
+        file_type = 'md'
+    else:
+        filename = f'{_safe_filename(project_name)}项目资料清单_{style_label}.docx'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        _write_docx(export_path, title, content, style, project_name)
+        file_type = 'docx'
 
     metadata = {
         'project_id': project_id,
@@ -382,6 +449,7 @@ def export_step1(project_id: str, payload: Step1ExportRequest = Body(...), user_
         'content_text': content,
         'content_json': payload.content_json,
         'export_style': style,
+        'export_format': export_format,
         'export_filename': filename,
         'storage_key': str(export_path),
         'exported_at': datetime.utcnow().isoformat(),
@@ -396,7 +464,7 @@ def export_step1(project_id: str, payload: Step1ExportRequest = Body(...), user_
                 user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
-                file_type='docx',
+                file_type=file_type,
                 storage_key=str(export_path),
                 source_type='step1_export_final',
                 file_size=export_path.stat().st_size,
@@ -426,25 +494,44 @@ def export_step2(project_id: str, payload: Step2ExportRequest = Body(...), user_
 
     project_name = payload.project_name.strip() or f'项目 {project_id}'
     style = payload.export_style if payload.export_style in {'classic', 'custom'} else 'classic'
+    export_format = _normalize_export_format(payload.export_format)
     style_label = '经典排版' if style == 'classic' else '自定义排版'
     title = payload.custom_title.strip() if payload.custom_title and payload.custom_title.strip() else f'{project_name}项目核心内容'
-    filename = f'{_safe_filename(project_name)}项目核心内容_{style_label}.docx'
-    export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
-    export_dir.mkdir(parents=True, exist_ok=True)
-    export_path = export_dir / f'{uuid4().hex}_{filename}'
-
-    typography = _step2_typography(style, payload.format_options)
     categories = [c for c in (payload.categories or []) if isinstance(c, str) and c.strip()]
 
-    _write_step2_docx(
-        export_path,
-        title=title,
-        content=content,
-        export_style=style,
-        project_name=project_name,
-        categories=categories,
-        typography=typography,
-    )
+    export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    if export_format == 'markdown':
+        filename = f'{_safe_filename(project_name)}项目核心内容.md'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        extra_meta: list[tuple[str, str]] = []
+        if categories:
+            extra_meta.append(('分类清单', '、'.join(categories)))
+        md_text = _build_markdown_export(
+            title=title,
+            content=content,
+            project_name=project_name,
+            doc_type='项目核心内容',
+            export_style=style,
+            extra_meta=extra_meta,
+        )
+        export_path.write_text(md_text, encoding='utf-8')
+        file_type = 'md'
+    else:
+        filename = f'{_safe_filename(project_name)}项目核心内容_{style_label}.docx'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        typography = _step2_typography(style, payload.format_options)
+        _write_step2_docx(
+            export_path,
+            title=title,
+            content=content,
+            export_style=style,
+            project_name=project_name,
+            categories=categories,
+            typography=typography,
+        )
+        file_type = 'docx'
 
     metadata = {
         'project_id': project_id,
@@ -453,12 +540,12 @@ def export_step2(project_id: str, payload: Step2ExportRequest = Body(...), user_
         'content_text': content,
         'content_json': payload.content_json,
         'export_style': style,
+        'export_format': export_format,
         'export_filename': filename,
         'storage_key': str(export_path),
         'exported_at': datetime.utcnow().isoformat(),
         'draft_payload': payload.draft_payload,
         'categories': categories,
-        'typography': typography,
     }
     file_record: dict[str, Any] | None = None
     if payload.save_to_database:
@@ -469,7 +556,7 @@ def export_step2(project_id: str, payload: Step2ExportRequest = Body(...), user_
                 user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
-                file_type='docx',
+                file_type=file_type,
                 storage_key=str(export_path),
                 source_type='step2_export_final',
                 file_size=export_path.stat().st_size,
@@ -495,9 +582,10 @@ def download_export(project_id: str, filename: str) -> FileResponse:
     if not export_path.exists():
         raise HTTPException(status_code=404, detail='export file not found')
     display_name = safe_name.split('_', 1)[-1] if '_' in safe_name else safe_name
+    media_type = _media_type_for(display_name)
     return FileResponse(
         path=export_path,
-        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        media_type=media_type,
         headers={'Content-Disposition': _attachment_disposition(display_name)},
     )
 
@@ -516,9 +604,98 @@ class GenericStepExportRequest(BaseModel):
     project_name: str = Field(default='')
     content_text: str = Field(default='', min_length=1)
     export_style: str = Field(default='classic')
+    export_format: str = Field(default='markdown', description='markdown | docx')
     custom_title: str | None = None
     project_id: str | None = None
     save_to_database: bool = Field(default=True)
+
+
+class Step14ExportRequest(BaseModel):
+    project_name: str = Field(default='')
+    content_text: str = Field(default='', min_length=1)
+    custom_title: str | None = None
+    export_format: str = Field(default='markdown', description='markdown | docx')
+    save_to_database: bool = Field(default=True)
+
+
+@router.post('/step14/{project_id}')
+def export_step14(project_id: str, payload: Step14ExportRequest = Body(...), user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+    content = payload.content_text.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail='content_text is required')
+    placeholder_values = {'最终版本内容将在这里编辑。', '最后版本内容将在这里编辑。'}
+    if content in placeholder_values or len(content) < 10:
+        raise HTTPException(status_code=400, detail='当前评价报告内容为空或仍为占位文本，请先生成 / 编辑 Step14 成果后再导出')
+
+    project_name = payload.project_name.strip() or f'项目 {project_id}'
+    export_format = _normalize_export_format(payload.export_format)
+    title = (
+        payload.custom_title.strip()
+        if payload.custom_title and payload.custom_title.strip()
+        else f'{project_name} · 评价报告'
+    )
+
+    export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
+    export_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if export_format == 'markdown':
+        filename = f'{_safe_filename(project_name)}_评价报告_{timestamp}.md'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        md_text = _build_markdown_export(
+            title=title,
+            content=content,
+            project_name=project_name,
+            doc_type='评价报告',
+            extra_meta=[('阶段编号', 'step14')],
+        )
+        export_path.write_text(md_text, encoding='utf-8')
+        file_type = 'md'
+    else:
+        filename = f'{_safe_filename(project_name)}_评价报告_{timestamp}.docx'
+        export_path = export_dir / f'{uuid4().hex}_{filename}'
+        docx_bytes = _build_generic_docx(
+            title=title,
+            content=content,
+            export_style='classic',
+            project_name=project_name,
+            step_code='step14',
+        )
+        export_path.write_bytes(docx_bytes)
+        file_type = 'docx'
+
+    metadata = {
+        'project_id': project_id,
+        'project_name': project_name,
+        'content_text': content,
+        'export_format': export_format,
+        'export_filename': filename,
+        'storage_key': str(export_path),
+        'exported_at': datetime.utcnow().isoformat(),
+    }
+    file_record: dict[str, Any] | None = None
+    if payload.save_to_database:
+        with SessionLocal() as db:
+            file_record = FileService(db).create_file_record(
+                project_id=project_id,
+                user_id=user_id,
+                project_name=project_name,
+                file_name=filename,
+                file_type=file_type,
+                storage_key=str(export_path),
+                source_type='step14_export_final',
+                file_size=export_path.stat().st_size,
+                metadata_json=json.dumps(metadata, ensure_ascii=False),
+            )
+
+    return {
+        'project_id': project_id,
+        'file_name': filename,
+        'storage_key': str(export_path),
+        'download_url': f'/api/v1/exports/download/{project_id}/{quote(export_path.name, safe="")}',
+        'file_record': file_record,
+        'metadata': metadata,
+    }
 
 
 def _step_default_title(step_code: str) -> str:
@@ -640,6 +817,7 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
 
     project_name = payload.project_name.strip() or '未命名项目'
     style = payload.export_style if payload.export_style in {'classic', 'custom'} else 'classic'
+    export_format = _normalize_export_format(payload.export_format)
     title = (
         payload.custom_title.strip()
         if payload.custom_title and payload.custom_title.strip()
@@ -647,22 +825,39 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
     )
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'{_safe_filename(project_name)}_{code}_{timestamp}.docx'
 
-    docx_bytes = _build_generic_docx(
-        title=title,
-        content=content,
-        export_style=style,
-        project_name=project_name,
-        step_code=code,
-    )
+    if export_format == 'markdown':
+        filename = f'{_safe_filename(project_name)}_{code}_{timestamp}.md'
+        doc_type = STEP_TITLE_MAP.get(code, '阶段成果')
+        md_text = _build_markdown_export(
+            title=title,
+            content=content,
+            project_name=project_name,
+            doc_type=doc_type,
+            export_style=style,
+            extra_meta=[('阶段编号', code)],
+        )
+        file_bytes = md_text.encode('utf-8')
+        file_type = 'md'
+        media_type = 'text/markdown; charset=utf-8'
+    else:
+        filename = f'{_safe_filename(project_name)}_{code}_{timestamp}.docx'
+        file_bytes = _build_generic_docx(
+            title=title,
+            content=content,
+            export_style=style,
+            project_name=project_name,
+            step_code=code,
+        )
+        file_type = 'docx'
+        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
     project_id = (payload.project_id or '').strip()
     if payload.save_to_database and project_id:
         export_dir = Path(__file__).resolve().parents[4] / 'storage' / 'projects' / project_id / 'exports'
         export_dir.mkdir(parents=True, exist_ok=True)
         export_path = export_dir / f'{uuid4().hex}_{filename}'
-        export_path.write_bytes(docx_bytes)
+        export_path.write_bytes(file_bytes)
 
         metadata = {
             'project_id': project_id,
@@ -670,6 +865,7 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
             'step_code': code,
             'content_text': content,
             'export_style': style,
+            'export_format': export_format,
             'export_filename': filename,
             'storage_key': str(export_path),
             'exported_at': datetime.utcnow().isoformat(),
@@ -680,16 +876,16 @@ def export_step_word(step_code: str, payload: GenericStepExportRequest = Body(..
                 user_id=user_id,
                 project_name=project_name,
                 file_name=filename,
-                file_type='docx',
+                file_type=file_type,
                 storage_key=str(export_path),
                 source_type=f'{code}_export_final',
-                file_size=len(docx_bytes),
+                file_size=len(file_bytes),
                 metadata_json=json.dumps(metadata, ensure_ascii=False),
             )
 
     return StreamingResponse(
-        io.BytesIO(docx_bytes),
-        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        io.BytesIO(file_bytes),
+        media_type=media_type,
         headers={'Content-Disposition': _attachment_disposition(filename)},
     )
 

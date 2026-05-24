@@ -38,10 +38,19 @@ class ModelCreateRequest(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     supports_vision: bool = False
+    kind: str = "chat"
+    dimensions: int | None = None
 
 
 class ModelToggleRequest(BaseModel):
-    enabled: bool = True
+    enabled: bool | None = None
+    name: str | None = None
+    model_id: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    supports_vision: bool | None = None
+    kind: str | None = None
+    dimensions: int | None = None
 
 
 class KbCreateRequest(BaseModel):
@@ -271,6 +280,8 @@ def create_model(
         api_key=payload.api_key,
         base_url=payload.base_url,
         supports_vision=payload.supports_vision,
+        kind=payload.kind,
+        dimensions=payload.dimensions,
     )
 
 
@@ -281,7 +292,7 @@ def toggle_model(
     service: AdminService = Depends(get_admin_service),
 ) -> dict[str, object]:
     try:
-        return service.toggle_model(model_id, payload.enabled)
+        return service.update_model(model_id, payload.model_dump(exclude_none=True))
     except ValueError as exc:
         raise not_found(str(exc)) from exc
 
@@ -291,6 +302,18 @@ def delete_model(model_id: str, service: AdminService = Depends(get_admin_servic
     try:
         service.delete_model(model_id)
         return {"message": "deleted"}
+    except ValueError as exc:
+        raise not_found(str(exc)) from exc
+
+
+@router.post("/models/{model_id}/set-default")
+def set_default_model(
+    model_id: str,
+    actor_user_id: str = Depends(get_actor_user_id),
+    service: AdminService = Depends(get_admin_service),
+) -> dict[str, object]:
+    try:
+        return service.set_default_model(model_id, actor_user_id=actor_user_id)
     except ValueError as exc:
         raise not_found(str(exc)) from exc
 

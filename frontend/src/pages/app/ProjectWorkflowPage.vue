@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch, watchEffect } from 'vue'
 import type { UploadFile, UploadProps } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '../../components/ef/PageHeader.vue'
@@ -10,9 +10,16 @@ import ArtifactEditor from '../../components/ef/ArtifactEditor.vue'
 import HistoryDrawer from '../../components/ef/HistoryDrawer.vue'
 import ChatDrawer from '../../components/ef/ChatDrawer.vue'
 import TaskProgress from '../../components/ef/TaskProgress.vue'
+import Step1Analysis from '../../components/ef/Step1Analysis.vue'
+import MarkdownDashboard from '../../components/ef/MarkdownDashboard.vue'
 import { ElMessage } from 'element-plus'
 import { cancelAgentRun, runAgent, type AgentRunResponse } from '../../services/agent'
-import { downloadExportFile, exportStep1, exportStep2, exportStep14Word, type Step2FormatOptions } from '../../services/exports'
+import { useWorkflowBus } from '../../stores/workflowBus'
+
+const props = withDefaults(defineProps<{ embeddedMode?: boolean }>(), { embeddedMode: false })
+
+const workflowBus = useWorkflowBus()
+import { downloadExportFile, exportStep1, exportStep2, exportStep14Word, type ExportFormat, type Step2FormatOptions } from '../../services/exports'
 import { createFileRecord, deleteFile, isInputProjectFile, listFiles, uploadProjectFile, type FileRecord } from '../../services/files'
 import { deleteStepHistory, getStepResult, getWorkflowStatus, listStepHistories, saveStepResult, type WorkflowStatusResponse } from '../../services/steps'
 
@@ -25,7 +32,9 @@ const stepId = computed(() => {
   return fromRoute || fromQuery || 1
 })
 const loading = ref(false)
+const stopping = ref(false)
 const activeRunId = ref('')
+const activeRunAbortController = ref<AbortController | null>(null)
 const saving = ref(false)
 const uploading = ref(false)
 const uploadingChannel = ref<'media' | 'documents'>('documents')
@@ -72,10 +81,12 @@ const workflowState = computed(() => ({
 }))
 const exportDialogVisible = ref(false)
 const exportStyle = ref<'classic' | 'custom'>('classic')
+const exportFormat = ref<ExportFormat>('markdown')
 const exportCustomTitle = ref('')
 const exportSaving = ref(false)
 const lastExportUrl = ref('')
 const lastExportFileName = ref('')
+const exportPreviewMode = ref<'raw' | 'preview'>('raw')
 
 const DEFAULT_STEP2_CATEGORIES = ['资金管理类', '预算管理类', '制度文件类', '项目实施类']
 const REQUIRED_STEP2_DIMENSIONS = ['项目背景', '项目实施内容', '项目组织管理情况', '项目资金投入与支出情况', '项目绩效目标', '项目实际产出情况', '效益情况']
@@ -84,6 +95,8 @@ const step2ExtraCategories = ref<string[]>([])
 const step2NewCategoryInput = ref('')
 const step2MediaModelId = ref('')
 const step2DocsModelId = ref('')
+const gapUploadPickerVisible = ref(false)
+const gapUploadPickerMaterial = ref('')
 const step2VerificationAck = ref(false)
 const step2ReviewMode = ref<'approve' | 'modify'>('approve')
 const step2ReviewFeedback = ref('')
@@ -94,9 +107,12 @@ const step2SourceIndex = ref<Array<{ ref_id: string; source_name: string; channe
 const step2MediaMetadata = ref<Array<Record<string, unknown>>>([])
 const step2DocsMetadata = ref<Array<Record<string, unknown>>>([])
 const step2StatusText = ref('')
+const step2DigestViewMode = ref<'raw' | 'preview'>('raw')
 const step2ActiveCompareIndex = ref(0)
+const step2CompareViewMode = ref<'raw' | 'preview'>('raw')
 const step2ExportDialogVisible = ref(false)
 const step2ExportStyle = ref<'classic' | 'custom'>('classic')
+const step2ExportFormat = ref<ExportFormat>('markdown')
 const step2ExportCustomTitle = ref('')
 const step2ExportSaving = ref(false)
 const lastStep2ExportUrl = ref('')
@@ -141,7 +157,7 @@ const step2MediaModelSupportsVision = computed(() => {
   return found ? isVisionCapableModel(found) : false
 })
 const step2HasFiles = computed(() => mediaFiles.value.length > 0 || documentFiles.value.length > 0)
-const step2HasContent = computed(() => Boolean((editor.value || '').trim() && !placeholderEditorTexts.includes((editor.value || '').trim())))
+const step2HasContent = computed(() => !isEditorEmpty(editor.value))
 const step2CanRefine = computed(() => step2HasContent.value && step2ReviewFeedback.value.trim().length > 0)
 const confirmDialogVisible = ref(false)
 const confirmDialogTitle = ref('')
@@ -149,17 +165,34 @@ const confirmDialogMessage = ref('')
 const confirmDialogType = ref<'warning' | 'danger' | 'info'>('warning')
 const confirmDialogOkText = ref('确定')
 const pendingConfirmAction = ref<null | (() => Promise<void> | void)>(null)
-const editor = ref('最终版本内容将在这里编辑。')
+const editor = ref('')
+const editorPlaceholder = '最终版本内容将在这里编辑。'
 const step1DraftKey = computed(() => `ef_step1_draft:${projectId.value}:${step1ThreadId.value}`)
 const step1DraftHistoryKey = computed(() => `ef_step1_draft_history:${projectId.value}:${step1ThreadId.value}`)
 const currentResult = ref<Record<string, unknown> | null>(null)
+const step1StructuredAnalysis = computed(() => {
+  const sa = currentResult.value?.structured_analysis as Record<string, unknown> | undefined
+  return {
+    keyMetrics: (sa?.key_metrics ?? []) as Array<{ label: string; value: string; source: string }>,
+    gapAnalysis: (sa?.gap_analysis ?? []) as Array<{ material: string; status: 'success' | 'error' | 'warning'; note: string }>,
+    dataFlow: (sa?.data_flow ?? []) as Array<{ file_name: string; file_type: string; target_steps: string[] }>,
+  }
+})
 const step1DraftHistory = ref<Array<{ id: string; title: string; content: string; source: string; created_at: string }>>([])
+const step1DraftViewMode = ref<'edit' | 'preview'>('edit')
+const step1ExpandDialog = ref(false)
+const draftPreviewModes = ref<Record<string, 'raw' | 'preview'>>({})
 const projectFiles = ref<FileRecord[]>([])
 const projectName = ref(localStorage.getItem('ef_project_name') || '')
 const historyItems = ref<Array<{ id: string; title: string; desc: string; content: string }>>([])
 const currentOutputs = ref<Array<{ title: string; desc: string; content: string }>>([])
 const compareItems = ref<Array<{ label: string; content: string }>>([])
-const placeholderEditorTexts = ['最终版本内容将在这里编辑。', '最后版本内容将在这里编辑。']
+const placeholderEditorTexts = [editorPlaceholder, '最后版本内容将在这里编辑。']
+
+function isEditorEmpty(value = editor.value) {
+  const trimmed = (value || '').trim()
+  return !trimmed || placeholderEditorTexts.includes(trimmed)
+}
 const step3State = ref<Record<string, unknown> | null>(null)
 const step3Structured = ref<{ skeleton: Array<Record<string, unknown>>; level2Items: Array<Record<string, unknown>>; level3Items: Array<Record<string, unknown>> }>({
   skeleton: [],
@@ -190,6 +223,9 @@ const step3L3Draft = ref('')
 const step3L3Comparisons = ref<Array<{ model_name: string; label: string; draft: string; error: string }>>([])
 const step3L3ReviewMode = ref<'approve' | 'modify'>('approve')
 const step3L3Feedback = ref('')
+const step3L3ViewMode = ref<'edit' | 'preview'>('edit')
+const step3L3CompareViewMode = ref<'raw' | 'preview'>('raw')
+const step3L3ActiveCompareIndex = ref(0)
 const step3SkeletonPhase = ref<'config' | 'skeleton' | 'generating_l3' | 'completed'>('config')
 const step3Templates: Array<{ id: string; name: string; tasks: Step3L2Task[] }> = [
   {
@@ -260,8 +296,10 @@ const step4TotalScore = ref(100)
 const step5ScoreSheet = ref('')
 const step9StyleMode = ref<'neutral' | 'sharp' | 'gentle'>('neutral')
 const step14ExportSaving = ref(false)
+const step14ExportFormat = ref<ExportFormat>('markdown')
 const step14ExportCustomTitle = ref('')
 const prevStepContent = ref('')
+const prevStepViewMode = ref<'raw' | 'preview'>('raw')
 
 const workflowStatus = ref<WorkflowStatusResponse | null>(null)
 type ClientModelConfig = {
@@ -386,7 +424,7 @@ const canGenerate = computed(() => {
     return typeof step2Core === 'string' && step2Core.trim().length > 0
   }
   if (stepId.value === 4) return step4FlatL2Tasks.value.length > 0
-  if (stepId.value >= 5 && stepId.value <= 14) return prevStepContent.value.trim().length > 0 || editor.value.trim().length > 0
+  if (stepId.value >= 5 && stepId.value <= 14) return prevStepContent.value.trim().length > 0 || !isEditorEmpty()
   return inputProjectFiles.value.length > 0
 })
 const mediaFiles = computed(() => inputProjectFiles.value.filter((item) => isMediaFile(item.file_type, item.file_name)))
@@ -487,6 +525,7 @@ async function submitStep1Export(downloadAfter = true) {
       content_text: content,
       content_json: resultText.value,
       export_style: exportStyle.value,
+      export_format: exportFormat.value,
       custom_title: exportCustomTitle.value,
       save_to_database: false,
     })
@@ -494,9 +533,10 @@ async function submitStep1Export(downloadAfter = true) {
     lastExportFileName.value = response.file_name
     if (downloadAfter) {
       await downloadExportFile(response.download_url, response.file_name)
-      ElMessage.success('Step1 成果 Word 已导出并开始下载')
+      const tip = exportFormat.value === 'markdown' ? 'Markdown' : 'Word'
+      ElMessage.success(`Step1 成果 ${tip} 已导出并开始下载`)
     } else {
-      ElMessage.success('Step1 成果 Word 已生成，可点击「下载上次导出」')
+      ElMessage.success('Step1 成果文件已生成，可点击「下载上次导出」')
     }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '导出失败')
@@ -569,7 +609,7 @@ function saveStep1DraftHistory() {
 
 function pushStep1DraftSnapshot(content: string, source: string) {
   const value = content.trim()
-  if (!value) return
+  if (!value || placeholderEditorTexts.includes(value)) return
   const latest = step1DraftHistory.value[0]
   if (latest?.content.trim() === value) return
   step1DraftHistory.value = [
@@ -583,6 +623,23 @@ function pushStep1DraftSnapshot(content: string, source: string) {
     ...step1DraftHistory.value,
   ].slice(0, 20)
   saveStep1DraftHistory()
+}
+
+function deleteStep1DraftSnapshot(index: number) {
+  const item = step1DraftHistory.value[index]
+  if (!item) return
+  openConfirmDialog({
+    title: '删除未提交草稿',
+    message: `确定删除「${item.title}（${item.source}）」吗？该版本将从内存与本地缓存中移除。`,
+    type: 'danger',
+    okText: '删除',
+    action: async () => {
+      step1DraftHistory.value.splice(index, 1)
+      delete draftPreviewModes.value[item.id]
+      saveStep1DraftHistory()
+      ElMessage.success('已删除该草稿版本')
+    },
+  })
 }
 
 function restoreStep1DraftSnapshot(index: number) {
@@ -650,10 +707,11 @@ function loadStep1DraftIntoEditor() {
   const draft = loadStep1DraftState()
   if (!draft) return
   const content = draft.content_text
-  if (typeof content === 'string' && content.trim()) {
+  if (typeof content === 'string' && content.trim() && !placeholderEditorTexts.includes(content.trim())) {
     editor.value = content
     resultText.value = typeof draft.content_json === 'string' ? draft.content_json : resultText.value
-    currentResult.value = draft
+    const savedResult = draft.current_result as Record<string, unknown> | null | undefined
+    currentResult.value = savedResult && typeof savedResult === 'object' ? savedResult : draft
   }
 }
 
@@ -710,6 +768,18 @@ function openUploadDialog(channel: 'media' | 'documents') {
   uploadingChannel.value = channel
   uploadQueue.value = []
   uploadDialogVisible.value = true
+}
+
+function onRequestUpload(payload: { material: string }) {
+  gapUploadPickerMaterial.value = payload.material
+  gapUploadPickerVisible.value = true
+}
+
+function pickGapUploadChannel(channel: 'media' | 'documents') {
+  gapUploadPickerVisible.value = false
+  const channelLabel = channel === 'media' ? '图片 / PDF' : '文档'
+  ElMessage.info(`补齐资料：${gapUploadPickerMaterial.value} → ${channelLabel}通道`)
+  openUploadDialog(channel)
 }
 
 function clearUploadQueue() {
@@ -841,6 +911,62 @@ async function loadResult() {
   if (stepId.value === 1) {
     loadStep1DraftHistory()
     loadStep1DraftIntoEditor()
+    try {
+      const files = await listFiles(projectId.value)
+      const commits = files.filter((f) => f.source_type === 'step1_draft_commit')
+      let committed: FileRecord | null = null
+      let committedTime = ''
+      for (const f of commits) {
+        let ts = ''
+        if (f.metadata_json) {
+          try {
+            const m = JSON.parse(f.metadata_json) as Record<string, unknown>
+            if (typeof m.updated_at === 'string') ts = m.updated_at
+          } catch {
+            ts = ''
+          }
+        }
+        if (!committed || ts > committedTime) {
+          committed = f
+          committedTime = ts
+        }
+      }
+      if (committed?.metadata_json) {
+        let metadata: Record<string, unknown> | null = null
+        try {
+          const parsed = JSON.parse(committed.metadata_json)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            metadata = parsed as Record<string, unknown>
+          }
+        } catch {
+          metadata = null
+        }
+        if (metadata) {
+          const savedResult = (metadata.current_result && typeof metadata.current_result === 'object')
+            ? metadata.current_result as Record<string, unknown>
+            : null
+          const previousResult = (currentResult.value && typeof currentResult.value === 'object')
+            ? currentResult.value as Record<string, unknown>
+            : {}
+          const merged: Record<string, unknown> = {
+            ...(savedResult ?? {}),
+            ...previousResult,
+          }
+          if (savedResult?.structured_analysis && !previousResult.structured_analysis) {
+            merged.structured_analysis = savedResult.structured_analysis
+          }
+          currentResult.value = merged
+          if (!editor.value.trim() && typeof metadata.content_text === 'string' && metadata.content_text.trim()) {
+            editor.value = metadata.content_text
+          }
+          if (!resultText.value && typeof metadata.content_json === 'string') {
+            resultText.value = metadata.content_json
+          }
+        }
+      }
+    } catch {
+      // step1 not committed yet — keep localStorage-restored state
+    }
   }
   if (stepId.value === 3) {
     try {
@@ -887,6 +1013,17 @@ async function loadResult() {
     } catch {
       // step2 not generated yet
     }
+    try {
+      const step1Res = await getStepResult('step1', projectId.value)
+      const step1Result = (step1Res.result as Record<string, unknown>) || null
+      const step1Sa = step1Result?.structured_analysis
+      if (step1Sa) {
+        currentResult.value = {
+          ...(currentResult.value ?? {}),
+          structured_analysis: step1Sa,
+        }
+      }
+    } catch { /* step1 not available */ }
   } else if (stepId.value !== 1) {
     if (stepId.value === 4) {
       try {
@@ -1157,6 +1294,7 @@ async function submitStep2Export(downloadAfter = true) {
       content_text: content,
       content_json: resultText.value,
       export_style: step2ExportStyle.value,
+      export_format: step2ExportFormat.value,
       custom_title: step2ExportCustomTitle.value,
       save_to_database: false,
       categories: step2MergedCategories.value,
@@ -1166,9 +1304,10 @@ async function submitStep2Export(downloadAfter = true) {
     lastStep2ExportFileName.value = response.file_name
     if (downloadAfter) {
       await downloadExportFile(response.download_url, response.file_name)
-      ElMessage.success('Step2 核心内容 Word 已导出并开始下载')
+      const tip = step2ExportFormat.value === 'markdown' ? 'Markdown' : 'Word'
+      ElMessage.success(`Step2 核心内容 ${tip} 已导出并开始下载`)
     } else {
-      ElMessage.success('Step2 核心内容 Word 已生成，可点击「下载上次导出」')
+      ElMessage.success('Step2 核心内容文件已生成，可点击「下载上次导出」')
     }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '导出失败')
@@ -1259,7 +1398,7 @@ function applyAgentResult(res: AgentRunResponse) {
 
 async function saveCurrentStep() {
   if (stepId.value === 1) {
-    if (!editor.value.trim()) {
+    if (isEditorEmpty()) {
       ElMessage.warning('成品区内容为空，无法保存 Step1 草稿')
       return
     }
@@ -1310,7 +1449,7 @@ async function saveCurrentStep() {
     })
     return
   }
-  if (!editor.value.trim()) {
+  if (isEditorEmpty()) {
     ElMessage.warning('成品区内容为空，无法保存')
     return
   }
@@ -1349,7 +1488,27 @@ async function saveCurrentStep() {
           content_json: step3Json,
           model_name: 'manual-edit',
         })
-        currentResult.value = { status: 'saved', content_text: saved.content_text, version: saved.version }
+        let restoredFromSavedJson: Record<string, unknown> | null = null
+        if (typeof saved.content_json === 'string' && saved.content_json.trim()) {
+          try {
+            const parsed = JSON.parse(saved.content_json)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              restoredFromSavedJson = parsed as Record<string, unknown>
+            }
+          } catch {
+            restoredFromSavedJson = null
+          }
+        }
+        const previousResult = (currentResult.value && typeof currentResult.value === 'object')
+          ? currentResult.value as Record<string, unknown>
+          : {}
+        currentResult.value = {
+          ...previousResult,
+          ...(restoredFromSavedJson ?? {}),
+          status: 'saved',
+          content_text: saved.content_text,
+          version: saved.version,
+        }
         resultText.value = saved.content_json || saved.content_text
         currentOutputs.value = [{
           title: `Step ${stepId.value} 当前结果`,
@@ -2091,7 +2250,7 @@ function openStep14ExportDialog() {
 }
 
 async function submitStep14Export() {
-  if (!editor.value.trim()) {
+  if (isEditorEmpty()) {
     ElMessage.warning('成品区内容为空，无法导出')
     return
   }
@@ -2101,11 +2260,13 @@ async function submitStep14Export() {
       project_name: getGlobalProjectName(),
       content_text: editor.value,
       custom_title: step14ExportCustomTitle.value || null,
+      export_format: step14ExportFormat.value,
     })
     lastStep14ExportUrl.value = res.download_url
     lastStep14ExportFileName.value = res.file_name
     await downloadExportFile(res.download_url, res.file_name)
-    ElMessage.success('Step14 评价报告已导出并下载')
+    const tip = step14ExportFormat.value === 'markdown' ? 'Markdown' : 'Word'
+    ElMessage.success(`Step14 评价报告 ${tip} 已导出并下载`)
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '导出失败')
   } finally {
@@ -2123,20 +2284,40 @@ async function downloadLastStep14Export() {
 }
 
 async function stopCurrentRun() {
-  if (!activeRunId.value) {
+  if (!activeRunId.value && !loading.value) {
     ElMessage.warning('当前没有正在运行的生成任务')
     return
   }
+  stopping.value = true
+  const runId = activeRunId.value
   try {
-    await cancelAgentRun(activeRunId.value)
-    ElMessage.success('已发送停止指令，后端正在取消当前生成任务')
+    activeRunAbortController.value?.abort()
+    if (runId) {
+      const res = await cancelAgentRun(runId)
+      if (res.cancelled) {
+        ElMessage.success('已发送停止指令，正在取消当前生成任务')
+      } else {
+        ElMessage.info('任务可能已结束，状态将自动刷新')
+      }
+    } else {
+      ElMessage.success('已停止当前生成请求')
+    }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '停止失败')
+  } finally {
+    loading.value = false
+    stopping.value = false
+    activeRunId.value = ''
+    activeRunAbortController.value = null
   }
 }
 
 async function runStep(prompt = '', options: { models?: string[] } = {}) {
+  activeRunAbortController.value?.abort()
+  const abortController = new AbortController()
+  activeRunAbortController.value = abortController
   loading.value = true
+  stopping.value = false
   error.value = ''
   const runId = `${stepCodeOf()}:${projectId.value}:${Date.now()}:${Math.random().toString(16).slice(2)}`
   activeRunId.value = runId
@@ -2178,7 +2359,7 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
         recent_messages: [],
         memory_scope: 'short_and_long',
       },
-    })
+    }, { signal: abortController.signal })
     if (stepId.value === 1) {
       pushStep1DraftSnapshot(editor.value, 'before_generate')
     }
@@ -2186,6 +2367,16 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
       applyStep3Result(res)
     } else {
       applyAgentResult(res)
+    }
+    const resultPayload = res.result as Record<string, unknown> | null
+    const resultError = typeof resultPayload?.error === 'string' ? resultPayload.error : ''
+    const resultStatus = typeof resultPayload?.status === 'string' ? resultPayload.status : ''
+    if (resultError && (resultStatus.includes('model_failed') || resultError.includes('Unauthorized') || resultError.includes('401') || resultError.includes('api_key') || resultError.includes('API Key'))) {
+      error.value = resultError
+      ElMessage.error({ message: `模型调用失败：${resultError.length > 120 ? resultError.slice(0, 120) + '…' : resultError}`, duration: 8000 })
+    } else if (resultError) {
+      error.value = resultError
+      ElMessage.warning({ message: resultError.length > 120 ? resultError.slice(0, 120) + '…' : resultError, duration: 6000 })
     }
     if (stepId.value === 1) {
       pushStep1DraftSnapshot(editor.value, 'generate')
@@ -2202,10 +2393,22 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
     }
     await loadWorkflowStatus()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : '生成失败'
+    const aborted = abortController.signal.aborted
+      || (e instanceof Error && (e.name === 'CanceledError' || e.message.includes('canceled') || e.message.includes('aborted')))
+    if (aborted) {
+      error.value = '生成任务已取消'
+      ElMessage.info('生成任务已停止')
+    } else if (e instanceof Error && (e.message.includes('499') || e.message.includes('cancelled') || e.message.includes('cancel'))) {
+      error.value = '生成任务已取消'
+      ElMessage.info('生成任务已停止')
+    } else {
+      error.value = e instanceof Error ? e.message : '生成失败'
+    }
   } finally {
     loading.value = false
+    stopping.value = false
     if (activeRunId.value === runId) activeRunId.value = ''
+    if (activeRunAbortController.value === abortController) activeRunAbortController.value = null
   }
 }
 
@@ -2217,11 +2420,30 @@ onMounted(() => {
   loadResult()
   loadStep1DraftIntoEditor()
 })
+
+watchEffect(() => {
+  workflowBus.currentStepId = stepId.value
+  workflowBus.isLoading = loading.value
+  workflowBus.currentProjectId = projectId.value
+})
+
+watch(() => workflowBus.pendingCommand, (cmd) => {
+  if (!cmd) return
+  const consumed = workflowBus.consume()
+  if (!consumed) return
+  if (consumed.action === 'goto_step' && consumed.step) {
+    goStep(consumed.step)
+  } else if (consumed.action === 'trigger_generate') {
+    runStep('')
+  } else if (consumed.action === 'stop') {
+    stopCurrentRun()
+  }
+})
 </script>
 
 <template>
-  <div class="workflow">
-    <PageHeader :title="`工作台 · Step ${stepId}`" :description="`项目 ${projectId} · 生成区 / 成品区 / 历史区三栏布局`">
+  <div class="workflow" :class="{ 'workflow--embedded': props.embeddedMode }">
+    <PageHeader v-if="!props.embeddedMode" :title="`工作台 · Step ${stepId}`" :description="`项目 ${projectId} · 生成区 / 成品区 / 历史区三栏布局`">
       <template #actions>
         <el-button @click="router.push(`/app/projects/${projectId}/overview`)">回总览</el-button>
         <el-button @click="historyOpen = true">历史</el-button>
@@ -2231,15 +2453,15 @@ onMounted(() => {
         <el-button v-if="stepId === 3 && step3SkeletonPhase === 'config'" type="primary" :loading="loading" @click="runStep3BuildSkeleton">构建指标体系骨架</el-button>
         <el-button v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3'" type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
         <el-button v-if="stepId === 3" type="success" :loading="saving" @click="finalizeStep3Workflow">完成 Step3 收尾并保存</el-button>
-        <el-button v-if="stepId === 14" type="warning" :loading="step14ExportSaving" :disabled="!editor.trim()" @click="openStep14ExportDialog">导出评价报告</el-button>
+        <el-button v-if="stepId === 14" type="warning" :loading="step14ExportSaving" :disabled="isEditorEmpty()" @click="openStep14ExportDialog">导出评价报告</el-button>
         <el-button :loading="saving" type="success" @click="saveCurrentStep">保存最终版本</el-button>
         <el-button v-if="stepId === 3" @click="loadResult">刷新 Step3 状态</el-button>
         <el-button type="primary" @click="chatOpen = true">AI 对话</el-button>
       </template>
     </PageHeader>
 
-    <div class="layout">
-      <StepSidebar :steps="steps" :active-step="stepId" @select="goStep" />
+    <div class="layout" :class="{ 'layout--no-sidebar': props.embeddedMode }">
+      <StepSidebar v-if="!props.embeddedMode" :steps="steps" :active-step="stepId" @select="goStep" />
 
       <div class="center">
         <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="mb" />
@@ -2247,6 +2469,8 @@ onMounted(() => {
           <GenerationPanel
             :title="titleMap[stepId] ?? `Step ${stepId}`"
             :loading="loading"
+            :stoppable="Boolean(activeRunId)"
+            :stopping="stopping"
             @generate="() => canGenerate ? runStep('') : undefined"
             @stop="stopCurrentRun"
           />
@@ -2366,27 +2590,57 @@ onMounted(() => {
           </el-card>
 
           <el-card v-if="stepId === 1" shadow="never">
-            <template #header>Step1 草稿编辑</template>
-            <el-alert
-              type="success"
-              :closable="false"
-              show-icon
-              class="mb"
-              :title="step1ThreadId ? `当前草稿线程：${step1ThreadId}` : '当前尚未创建线程。'"
+            <template #header>
+              <div class="card-head-with-toggle">
+                <span>Step1 草稿编辑</span>
+                <el-radio-group v-model="step1DraftViewMode" size="small">
+                  <el-radio-button value="edit">编辑</el-radio-button>
+                  <el-radio-button value="preview">看板预览</el-radio-button>
+                </el-radio-group>
+              </div>
+            </template>
+            <template v-if="step1DraftViewMode === 'edit'">
+              <el-alert
+                type="success"
+                :closable="false"
+                show-icon
+                class="mb"
+                :title="step1ThreadId ? `当前草稿线程：${step1ThreadId}` : '当前尚未创建线程。'"
+              />
+              <el-form label-width="110px">
+                <el-form-item label="项目名称">
+                  <el-input v-model="projectName" placeholder="系统会自动识别，也可以手工调整" />
+                </el-form-item>
+                <el-form-item label="草稿内容">
+                  <div class="draft-editor-wrap">
+                    <el-input v-model="editor" type="textarea" :rows="10" :placeholder="editorPlaceholder" />
+                    <el-button class="draft-editor-expand" size="small" plain @click="step1ExpandDialog = true">放大编辑</el-button>
+                  </div>
+                </el-form-item>
+              </el-form>
+              <div class="upload-toolbar">
+                <el-button type="primary" :loading="loading" @click="runStep('')">生成 / 刷新 Step1 草稿</el-button>
+                <el-button type="success" :loading="saving" @click="saveCurrentStep">确认提交 Step1 草稿</el-button>
+                <el-button type="warning" :loading="exportSaving" @click="openStep1ExportDialog">成果导出</el-button>
+              </div>
+            </template>
+            <MarkdownDashboard
+              v-else
+              :source="(currentResult?.final_manifest as string) || (currentResult?.draft_manifest as string) || editor"
+              :key-metrics="step1StructuredAnalysis.keyMetrics"
+              :gap-items="step1StructuredAnalysis.gapAnalysis"
+              @request-upload="onRequestUpload"
+              @step-click="goStep"
             />
-            <el-form label-width="110px">
-              <el-form-item label="项目名称">
-                <el-input v-model="projectName" placeholder="系统会自动识别，也可以手工调整" />
-              </el-form-item>
-              <el-form-item label="草稿内容">
-                <el-input v-model="editor" type="textarea" :rows="10" placeholder="这里会显示 Step1 草稿，支持人工编辑" />
-              </el-form-item>
-            </el-form>
-            <div class="upload-toolbar">
-              <el-button type="primary" :loading="loading" @click="runStep('')">生成 / 刷新 Step1 草稿</el-button>
-              <el-button type="success" :loading="saving" @click="saveCurrentStep">确认提交 Step1 草稿</el-button>
-              <el-button type="warning" :loading="exportSaving" @click="openStep1ExportDialog">成果导出</el-button>
-            </div>
+          </el-card>
+
+          <el-card v-if="stepId === 1" shadow="never">
+            <template #header>Step1 结构化分析（Three-Table View）</template>
+            <Step1Analysis
+              :key-metrics="step1StructuredAnalysis.keyMetrics"
+              :gap-analysis="step1StructuredAnalysis.gapAnalysis"
+              :data-flow="step1StructuredAnalysis.dataFlow"
+            />
           </el-card>
 
           <el-card v-if="stepId === 1" shadow="never">
@@ -2403,12 +2657,25 @@ onMounted(() => {
               <div class="draft-memory-list">
                 <div v-for="entry in pagedStep1DraftHistory" :key="entry.item.id" class="draft-memory-item">
                   <div class="draft-memory-main">
-                    <div class="draft-memory-title">{{ entry.item.title }} · {{ entry.item.source }}</div>
+                    <div class="draft-memory-title">
+                      <span>{{ entry.item.title }} · {{ entry.item.source }}</span>
+                      <el-radio-group
+                        :model-value="draftPreviewModes[entry.item.id] || 'raw'"
+                        size="small"
+                        class="draft-memory-toggle"
+                        @update:model-value="(v: string | number | boolean | undefined) => (draftPreviewModes[entry.item.id] = (v as 'raw' | 'preview'))"
+                      >
+                        <el-radio-button value="raw">原文</el-radio-button>
+                        <el-radio-button value="preview">看板</el-radio-button>
+                      </el-radio-group>
+                    </div>
                     <div class="draft-memory-desc">{{ entry.item.created_at }} · 第 {{ entry.index + 1 }} / {{ step1DraftHistory.length }} 版</div>
-                    <pre class="draft-memory-preview">{{ entry.item.content }}</pre>
+                    <pre v-if="(draftPreviewModes[entry.item.id] || 'raw') === 'raw'" class="draft-memory-preview">{{ entry.item.content }}</pre>
+                    <MarkdownDashboard v-else :source="entry.item.content" />
                   </div>
                   <div class="draft-memory-actions">
-                    <el-button size="small" type="primary" plain @click="restoreStep1DraftSnapshot(entry.index)">切换查看 / 回滚</el-button>
+                    <el-button size="small" type="primary" plain @click="restoreStep1DraftSnapshot(entry.index)">回滚</el-button>
+                    <el-button size="small" type="danger" plain @click="deleteStep1DraftSnapshot(entry.index)">删除</el-button>
                   </div>
                 </div>
               </div>
@@ -2580,7 +2847,14 @@ onMounted(() => {
                 </el-table>
               </el-tab-pane>
               <el-tab-pane label="识别摘要文本">
-                <pre class="result">{{ step2VerificationDigest || '暂无摘要文本' }}</pre>
+                <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+                  <el-radio-group v-model="step2DigestViewMode" size="small">
+                    <el-radio-button value="raw">原文</el-radio-button>
+                    <el-radio-button value="preview">看板</el-radio-button>
+                  </el-radio-group>
+                </div>
+                <pre v-if="step2DigestViewMode === 'raw'" class="result">{{ step2VerificationDigest || '暂无摘要文本' }}</pre>
+                <MarkdownDashboard v-else :source="step2VerificationDigest || ''" :source-index="step2SourceIndex" />
               </el-tab-pane>
             </el-tabs>
             <el-checkbox v-model="step2VerificationAck">已逐条对比原件，确认识别结果与上传资料一致</el-checkbox>
@@ -2618,8 +2892,15 @@ onMounted(() => {
               </div>
               <div class="step2-compare-detail">
                 <div v-if="step2ModelComparisons[step2ActiveCompareIndex]">
-                  <div class="step2-compare-detail-title">{{ step2ModelComparisons[step2ActiveCompareIndex].label || step2ModelComparisons[step2ActiveCompareIndex].model_name }}</div>
-                  <pre class="result">{{ step2ModelComparisons[step2ActiveCompareIndex].draft || (step2ModelComparisons[step2ActiveCompareIndex].error ? `调用失败：${step2ModelComparisons[step2ActiveCompareIndex].error}` : '空响应') }}</pre>
+                  <div class="step2-compare-detail-title" style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                    <span>{{ step2ModelComparisons[step2ActiveCompareIndex].label || step2ModelComparisons[step2ActiveCompareIndex].model_name }}</span>
+                    <el-radio-group v-model="step2CompareViewMode" size="small">
+                      <el-radio-button value="raw">原文</el-radio-button>
+                      <el-radio-button value="preview">看板</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <pre v-if="step2CompareViewMode === 'raw'" class="result">{{ step2ModelComparisons[step2ActiveCompareIndex].draft || (step2ModelComparisons[step2ActiveCompareIndex].error ? `调用失败：${step2ModelComparisons[step2ActiveCompareIndex].error}` : '空响应') }}</pre>
+                  <MarkdownDashboard v-else :source="step2ModelComparisons[step2ActiveCompareIndex].draft || ''" :source-index="step2SourceIndex" />
                   <div class="upload-toolbar">
                     <el-button type="primary" :disabled="!step2ModelComparisons[step2ActiveCompareIndex].draft" @click="applyStep2Comparison(step2ActiveCompareIndex)">把该草稿导入成品区</el-button>
                   </div>
@@ -2670,10 +2951,10 @@ onMounted(() => {
               :closable="false"
               show-icon
               class="mb"
-              title="下方为核心内容成品区。确认后可一键导出为带「项目核心内容」命名的 Word 文档；自定义排版支持字体、字号、行距、段距与首行缩进。"
+              title="下方为核心内容成品区。确认后默认以 Markdown 一键导出，亦可切换为 Word；自定义排版支持字体、字号、行距、段距与首行缩进。"
             />
             <div class="upload-toolbar">
-              <el-button type="warning" :loading="step2ExportSaving" @click="openStep2ExportDialog">导出 Step2 成果（PDF / Word）</el-button>
+              <el-button type="warning" :loading="step2ExportSaving" @click="openStep2ExportDialog">导出 Step2 成果（Markdown / Word）</el-button>
               <el-button v-if="lastStep2ExportUrl" @click="downloadLastStep2Export">下载上次导出</el-button>
             </div>
           </el-card>
@@ -2880,19 +3161,37 @@ onMounted(() => {
 
             <!-- 多模型对比 -->
             <el-card v-if="step3L3Comparisons.length > 1" shadow="never" style="margin-top: 12px; background: var(--el-fill-color-lighter);">
-              <template #header>多模型对比（共 {{ step3L3Comparisons.length }} 个模型）</template>
+              <template #header>
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                  <span>多模型对比（共 {{ step3L3Comparisons.length }} 个模型）</span>
+                  <el-radio-group v-model="step3L3CompareViewMode" size="small">
+                    <el-radio-button value="raw">原文</el-radio-button>
+                    <el-radio-button value="preview">看板</el-radio-button>
+                  </el-radio-group>
+                </div>
+              </template>
               <div class="step2-compare-layout">
                 <div class="step2-compare-list">
                   <div
                     v-for="(item, idx) in step3L3Comparisons"
                     :key="`l3-cmp-${idx}`"
                     class="step2-compare-card"
+                    :class="{ active: idx === step3L3ActiveCompareIndex }"
                     style="cursor: pointer;"
-                    @click="applyL3Comparison(idx)"
+                    @click="step3L3ActiveCompareIndex = idx"
                   >
                     <div class="step2-compare-title">{{ item.label || item.model_name }}</div>
                     <el-tag v-if="item.error" type="danger" size="small">调用失败</el-tag>
                     <el-tag v-else type="success" size="small">{{ (item.draft || '').length }} 字</el-tag>
+                  </div>
+                </div>
+                <div class="step2-compare-detail">
+                  <div v-if="step3L3Comparisons[step3L3ActiveCompareIndex]">
+                    <pre v-if="step3L3CompareViewMode === 'raw'" class="result">{{ step3L3Comparisons[step3L3ActiveCompareIndex].draft || (step3L3Comparisons[step3L3ActiveCompareIndex].error ? `调用失败：${step3L3Comparisons[step3L3ActiveCompareIndex].error}` : '空响应') }}</pre>
+                    <MarkdownDashboard v-else :source="step3L3Comparisons[step3L3ActiveCompareIndex].draft || ''" />
+                    <div class="upload-toolbar">
+                      <el-button type="primary" :disabled="!step3L3Comparisons[step3L3ActiveCompareIndex].draft" @click="applyL3Comparison(step3L3ActiveCompareIndex)">导入为当前草案</el-button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2901,7 +3200,16 @@ onMounted(() => {
             <!-- 当前三级指标草案 -->
             <el-form label-width="110px" style="margin-top: 12px;">
               <el-form-item label="三级指标草案">
-                <el-input v-model="step3L3Draft" type="textarea" :rows="12" placeholder="三级指标草案将显示在这里，支持直接编辑" />
+                <div style="width: 100%;">
+                  <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                    <el-radio-group v-model="step3L3ViewMode" size="small">
+                      <el-radio-button value="edit">编辑</el-radio-button>
+                      <el-radio-button value="preview">看板</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <el-input v-if="step3L3ViewMode === 'edit'" v-model="step3L3Draft" type="textarea" :rows="12" placeholder="三级指标草案将显示在这里，支持直接编辑" />
+                  <MarkdownDashboard v-else :source="step3L3Draft || ''" />
+                </div>
               </el-form-item>
               <el-form-item label="修改意见">
                 <el-input v-model="step3L3Feedback" type="textarea" :rows="3" placeholder="输入修改意见，让大模型根据意见重新生成（可选）" />
@@ -3088,7 +3396,16 @@ onMounted(() => {
             <el-alert v-else type="info" :closable="false" show-icon class="mb" :title="`基于 Step${stepId - 1} 输出内容继续生成。`" />
             <el-form v-if="prevStepContent" label-width="110px" class="mb">
               <el-form-item label="上一步内容">
-                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                <div style="width: 100%;">
+                  <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                    <el-radio-group v-model="prevStepViewMode" size="small">
+                      <el-radio-button value="raw">原文</el-radio-button>
+                      <el-radio-button value="preview">看板</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <el-input v-if="prevStepViewMode === 'raw'" :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                  <MarkdownDashboard v-else :source="prevStepContent" />
+                </div>
               </el-form-item>
             </el-form>
             <div class="upload-toolbar">
@@ -3112,7 +3429,16 @@ onMounted(() => {
             </el-form>
             <el-form v-if="prevStepContent" label-width="110px" class="mb">
               <el-form-item label="上一步内容">
-                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                <div style="width: 100%;">
+                  <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                    <el-radio-group v-model="prevStepViewMode" size="small">
+                      <el-radio-button value="raw">原文</el-radio-button>
+                      <el-radio-button value="preview">看板</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <el-input v-if="prevStepViewMode === 'raw'" :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                  <MarkdownDashboard v-else :source="prevStepContent" />
+                </div>
               </el-form-item>
             </el-form>
             <div class="upload-toolbar">
@@ -3124,7 +3450,7 @@ onMounted(() => {
           <el-card v-if="stepId === 14" shadow="never">
             <template #header>Step14 · 评价报告</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step13 结果，请确保上一步已完成并保存。" />
-            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="汇总所有步骤结果，生成最终评价报告。完成后可导出 Word 文档。" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="汇总所有步骤结果，生成最终评价报告。完成后可导出 Markdown 或 Word 文档。" />
             <el-form label-width="110px" class="mb">
               <el-form-item label="报告标题">
                 <el-input v-model="step14ExportCustomTitle" placeholder="例如 某项目绩效评价报告" />
@@ -3132,12 +3458,21 @@ onMounted(() => {
             </el-form>
             <el-form v-if="prevStepContent" label-width="110px" class="mb">
               <el-form-item label="上一步内容">
-                <el-input :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                <div style="width: 100%;">
+                  <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                    <el-radio-group v-model="prevStepViewMode" size="small">
+                      <el-radio-button value="raw">原文</el-radio-button>
+                      <el-radio-button value="preview">看板</el-radio-button>
+                    </el-radio-group>
+                  </div>
+                  <el-input v-if="prevStepViewMode === 'raw'" :model-value="prevStepContent" type="textarea" :rows="6" readonly />
+                  <MarkdownDashboard v-else :source="prevStepContent" />
+                </div>
               </el-form-item>
             </el-form>
             <div class="upload-toolbar">
               <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">生成评价报告</el-button>
-              <el-button type="warning" :loading="step14ExportSaving" :disabled="!editor.trim()" @click="openStep14ExportDialog">导出 Word</el-button>
+              <el-button type="warning" :loading="step14ExportSaving" :disabled="isEditorEmpty()" @click="openStep14ExportDialog">导出报告（Markdown / Word）</el-button>
               <el-button v-if="lastStep14ExportUrl" @click="downloadLastStep14Export">下载上次导出</el-button>
             </div>
           </el-card>
@@ -3156,7 +3491,19 @@ onMounted(() => {
               <el-button type="warning" :loading="exportSaving" @click="openStep1ExportDialog">成果导出</el-button>
             </div>
           </el-card>
-          <ArtifactEditor v-model="editor" :title="titleMap[stepId] ?? `Step ${stepId}`" :tag="stepId === 3 ? 'Step3 定稿区' : (currentResult?.status ? String(currentResult.status) : '最终版本')" :rows="18" />
+                    <ArtifactEditor
+            v-model="editor"
+            :title="titleMap[stepId] ?? `Step ${stepId}`"
+            :tag="stepId === 3 ? 'Step3 定稿区' : (currentResult?.status ? String(currentResult.status) : '最终版本')"
+            :rows="18"
+            :placeholder="editorPlaceholder"
+            :enable-dashboard="true"
+            :key-metrics="(stepId === 1 || stepId === 2) ? step1StructuredAnalysis.keyMetrics : undefined"
+            :gap-items="(stepId === 1 || stepId === 2) ? step1StructuredAnalysis.gapAnalysis : undefined"
+            :source-index="stepId === 2 ? step2SourceIndex : undefined"
+            @request-upload="onRequestUpload"
+            @step-click="goStep"
+          />
           <el-card shadow="never">
             <template #header>后端结果</template>
             <el-skeleton v-if="loading" :rows="4" animated />
@@ -3213,22 +3560,28 @@ onMounted(() => {
         :closable="false"
         show-icon
         class="mb"
-        title="导出会按当前成品区核心内容生成 Word 文档（.docx），并直接触发浏览器下载。若需要 PDF，可在本地用 Word / WPS 另存为 PDF。"
+        title="默认以 Markdown 格式导出当前成品区核心内容；切换为 Word 后可调整经典/自定义排版与字体字号。"
       />
       <el-form label-width="140px">
+        <el-form-item label="导出格式">
+          <el-radio-group v-model="step2ExportFormat">
+            <el-radio value="markdown">Markdown（.md）</el-radio>
+            <el-radio value="docx">Word（.docx）</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <el-form-item label="项目名称">
           <el-input :model-value="getGlobalProjectName()" disabled />
         </el-form-item>
         <el-form-item label="文档标题">
           <el-input v-model="step2ExportCustomTitle" placeholder="例如 某项目项目核心内容" />
         </el-form-item>
-        <el-form-item label="排版模式">
+        <el-form-item v-if="step2ExportFormat === 'docx'" label="排版模式">
           <el-radio-group v-model="step2ExportStyle">
             <el-radio label="classic">经典排版</el-radio>
             <el-radio label="custom">自定义排版</el-radio>
           </el-radio-group>
         </el-form-item>
-        <template v-if="step2ExportStyle === 'custom'">
+        <template v-if="step2ExportFormat === 'docx' && step2ExportStyle === 'custom'">
           <el-form-item label="正文字体">
             <el-select v-model="step2ExportFormatOptions.font_family" style="width: 100%">
               <el-option label="宋体（SimSun）" value="SimSun" />
@@ -3257,14 +3610,25 @@ onMounted(() => {
           </el-form-item>
         </template>
         <el-form-item label="导出内容预览">
-          <el-input :model-value="editor" type="textarea" :rows="8" readonly />
+          <div style="width: 100%;">
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+              <el-radio-group v-model="exportPreviewMode" size="small">
+                <el-radio-button value="raw">原文</el-radio-button>
+                <el-radio-button value="preview">看板</el-radio-button>
+              </el-radio-group>
+            </div>
+            <el-input v-if="exportPreviewMode === 'raw'" :model-value="editor" type="textarea" :rows="8" readonly />
+            <MarkdownDashboard v-else :source="editor || ''" />
+          </div>
         </el-form-item>
         <el-alert v-if="lastStep2ExportUrl" type="success" :closable="false" show-icon class="mb" :title="`已生成：${lastStep2ExportFileName}`" />
       </el-form>
       <template #footer>
         <el-button @click="step2ExportDialogVisible = false">关闭</el-button>
         <el-button v-if="lastStep2ExportUrl" @click="downloadLastStep2Export">下载上次导出</el-button>
-        <el-button type="primary" :loading="step2ExportSaving" @click="submitStep2Export(true)">导出 Word 并下载</el-button>
+        <el-button type="primary" :loading="step2ExportSaving" @click="submitStep2Export(true)">
+          {{ step2ExportFormat === 'markdown' ? '导出 Markdown 并下载' : '导出 Word 并下载' }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -3274,30 +3638,47 @@ onMounted(() => {
         :closable="false"
         show-icon
         class="mb"
-        title="导出会按当前成品区内容生成 Word 文档，并直接触发浏览器下载；不会写入 Step1 资料草稿清单。"
+        title="导出当前成品区内容，默认以 Markdown 格式下载；也可切换为 Word 文档。"
       />
       <el-form label-width="110px">
+        <el-form-item label="导出格式">
+          <el-radio-group v-model="exportFormat">
+            <el-radio value="markdown">Markdown（.md）</el-radio>
+            <el-radio value="docx">Word（.docx）</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <el-form-item label="项目名称">
           <el-input :model-value="getGlobalProjectName()" disabled />
         </el-form-item>
         <el-form-item label="文档标题">
           <el-input v-model="exportCustomTitle" placeholder="例如 某项目项目资料清单" />
         </el-form-item>
-        <el-form-item label="导出排版">
+        <el-form-item v-if="exportFormat === 'docx'" label="导出排版">
           <el-radio-group v-model="exportStyle">
             <el-radio label="classic">经典排版</el-radio>
             <el-radio label="custom">自定义排版</el-radio>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="导出内容">
-          <el-input :model-value="editor" type="textarea" :rows="8" readonly />
+          <div style="width: 100%;">
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+              <el-radio-group v-model="exportPreviewMode" size="small">
+                <el-radio-button value="raw">原文</el-radio-button>
+                <el-radio-button value="preview">看板</el-radio-button>
+              </el-radio-group>
+            </div>
+            <el-input v-if="exportPreviewMode === 'raw'" :model-value="editor" type="textarea" :rows="8" readonly />
+            <MarkdownDashboard v-else :source="editor || ''" />
+          </div>
         </el-form-item>
         <el-alert v-if="lastExportUrl" type="success" :closable="false" show-icon class="mb" :title="`已生成：${lastExportFileName}`" />
       </el-form>
       <template #footer>
         <el-button @click="exportDialogVisible = false">关闭</el-button>
         <el-button v-if="lastExportUrl" @click="downloadLastStep1Export">下载上次导出</el-button>
-        <el-button type="primary" :loading="exportSaving" @click="submitStep1Export(true)">导出 Word 并下载</el-button>
+        <el-button type="primary" :loading="exportSaving" @click="submitStep1Export(true)">
+          {{ exportFormat === 'markdown' ? '导出 Markdown 并下载' : '导出 Word 并下载' }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -3348,15 +3729,28 @@ onMounted(() => {
       </template>
     </el-dialog>
 
+    <el-dialog v-model="step1ExpandDialog" title="Step1 草稿放大编辑" fullscreen append-to-body class="ef-confirm-dialog">
+      <el-input v-model="editor" type="textarea" :rows="30" :placeholder="editorPlaceholder" />
+      <template #footer>
+        <el-button @click="step1ExpandDialog = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="step14ExportDialogVisible" title="Step14 评价报告导出" width="620px" class="ef-confirm-dialog">
       <el-alert
         type="info"
         :closable="false"
         show-icon
         class="mb"
-        title="导出会按当前成品区评价报告内容生成 Word 文档（.docx），并直接触发浏览器下载。"
+        title="默认以 Markdown 格式导出评价报告；也可切换为 Word 文档。"
       />
       <el-form label-width="110px">
+        <el-form-item label="导出格式">
+          <el-radio-group v-model="step14ExportFormat">
+            <el-radio value="markdown">Markdown（.md）</el-radio>
+            <el-radio value="docx">Word（.docx）</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <el-form-item label="项目名称">
           <el-input :model-value="getGlobalProjectName()" disabled />
         </el-form-item>
@@ -3364,14 +3758,25 @@ onMounted(() => {
           <el-input v-model="step14ExportCustomTitle" placeholder="例如 某项目绩效评价报告" />
         </el-form-item>
         <el-form-item label="导出内容预览">
-          <el-input :model-value="editor" type="textarea" :rows="8" readonly />
+          <div style="width: 100%;">
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+              <el-radio-group v-model="exportPreviewMode" size="small">
+                <el-radio-button value="raw">原文</el-radio-button>
+                <el-radio-button value="preview">看板</el-radio-button>
+              </el-radio-group>
+            </div>
+            <el-input v-if="exportPreviewMode === 'raw'" :model-value="editor" type="textarea" :rows="8" readonly />
+            <MarkdownDashboard v-else :source="editor || ''" />
+          </div>
         </el-form-item>
         <el-alert v-if="lastStep14ExportUrl" type="success" :closable="false" show-icon class="mb" :title="`已生成：${lastStep14ExportFileName}`" />
       </el-form>
       <template #footer>
         <el-button @click="step14ExportDialogVisible = false">关闭</el-button>
         <el-button v-if="lastStep14ExportUrl" @click="downloadLastStep14Export">下载上次导出</el-button>
-        <el-button type="primary" :loading="step14ExportSaving" @click="submitStep14Export">导出 Word 并下载</el-button>
+        <el-button type="primary" :loading="step14ExportSaving" @click="submitStep14Export">
+          {{ step14ExportFormat === 'markdown' ? '导出 Markdown 并下载' : '导出 Word 并下载' }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -3403,12 +3808,90 @@ onMounted(() => {
         </div>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="gapUploadPickerVisible"
+      :title="`补齐资料：${gapUploadPickerMaterial}`"
+      width="720px"
+      append-to-body
+      class="ef-confirm-dialog"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb"
+        title="请根据资料的格式选择对应的上传通道，并确认通道使用的模型。"
+      />
+      <div class="gap-channel-grid">
+        <div class="gap-channel-card">
+          <div class="gap-channel-head">
+            <span class="gap-channel-icon">📷</span>
+            <div>
+              <div class="gap-channel-title">图片 / PDF 通道</div>
+              <div class="gap-channel-sub">适合扫描件、批复照片、PDF 文档</div>
+            </div>
+          </div>
+          <div class="gap-channel-body">
+            <div class="gap-channel-label">当前通道模型</div>
+            <el-select v-model="step2MediaModelId" clearable placeholder="不绑定时全部已启用模型参与" size="small">
+              <el-option
+                v-for="option in step2ChannelModelOptions"
+                :key="option.id"
+                :label="option.label"
+                :value="option.id"
+              />
+            </el-select>
+            <el-alert
+              v-if="!step2MediaModelSupportsVision"
+              type="warning"
+              :closable="false"
+              show-icon
+              class="gap-channel-alert"
+              title="当前通道未绑定支持视觉的多模态模型，扫描件可能无法被识别。"
+            />
+          </div>
+          <el-button type="primary" class="gap-channel-action" @click="pickGapUploadChannel('media')">
+            选择此通道并上传
+          </el-button>
+        </div>
+
+        <div class="gap-channel-card">
+          <div class="gap-channel-head">
+            <span class="gap-channel-icon">📄</span>
+            <div>
+              <div class="gap-channel-title">Word / Excel 通道</div>
+              <div class="gap-channel-sub">适合制度、预算、实施方案等文本资料</div>
+            </div>
+          </div>
+          <div class="gap-channel-body">
+            <div class="gap-channel-label">当前通道模型</div>
+            <el-select v-model="step2DocsModelId" clearable placeholder="不绑定时全部已启用模型参与" size="small">
+              <el-option
+                v-for="option in step2ChannelModelOptions"
+                :key="option.id"
+                :label="option.label"
+                :value="option.id"
+              />
+            </el-select>
+          </div>
+          <el-button type="primary" class="gap-channel-action" @click="pickGapUploadChannel('documents')">
+            选择此通道并上传
+          </el-button>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="gapUploadPickerVisible = false">取消</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .workflow { max-width: 1400px; }
+.workflow--embedded { max-width: none; padding: 0; }
 .layout { display: grid; grid-template-columns: 200px minmax(0, 1fr) 260px; gap: 14px; align-items: start; }
+.layout--no-sidebar { grid-template-columns: minmax(0, 1fr) 260px; }
 .center { min-width: 0; }
 .stack { display: grid; gap: 12px; }
 .placeholder { padding: 20px; }
@@ -3443,10 +3926,14 @@ onMounted(() => {
 .draft-memory-list { display: grid; gap: 8px; }
 .draft-memory-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 12px; border: 1px solid var(--el-border-color-lighter); border-radius: 10px; padding: 10px 12px; background: var(--el-bg-color-page); }
 .draft-memory-main { min-width: 0; }
-.draft-memory-actions { display: flex; align-items: flex-start; }
-.draft-memory-title { font-size: 13px; font-weight: 700; color: var(--el-text-color-primary); }
+.draft-memory-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.draft-memory-title { font-size: 13px; font-weight: 700; color: var(--el-text-color-primary); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.draft-memory-toggle { margin-left: auto; }
 .draft-memory-desc { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 3px; }
 .draft-memory-preview { margin: 8px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.5; color: var(--el-text-color-regular); background: var(--el-fill-color-blank); border-radius: 8px; padding: 8px; }
+.card-head-with-toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; width: 100%; }
+.draft-editor-wrap { position: relative; width: 100%; }
+.draft-editor-expand { position: absolute; top: 6px; right: 8px; z-index: 2; }
 .step3-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
 .step3-summary-card { border: 1px solid var(--el-border-color-light); border-radius: 12px; padding: 12px 14px; background: var(--el-bg-color-page); }
 .step3-summary-title { font-size: 12px; color: var(--el-text-color-secondary); margin-bottom: 6px; }
@@ -3459,5 +3946,15 @@ onMounted(() => {
 :deep(.ef-confirm-dialog .el-dialog__footer) { padding-top: 0; }
 :deep(.ef-confirm-dialog .el-dialog__header) { padding-bottom: 10px; }
 :deep(.ef-upload-dialog .el-dialog__body) { padding-top: 8px; }
-@media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .upload-matrix { grid-template-columns: 1fr; } .step3-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.gap-channel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.gap-channel-card { border: 1px solid var(--el-border-color-light); border-radius: 12px; padding: 16px; background: var(--el-bg-color-page); display: grid; gap: 12px; align-content: start; }
+.gap-channel-head { display: flex; align-items: center; gap: 10px; }
+.gap-channel-icon { font-size: 22px; line-height: 1; }
+.gap-channel-title { font-weight: 700; font-size: 15px; color: var(--el-text-color-primary); }
+.gap-channel-sub { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 2px; }
+.gap-channel-body { display: grid; gap: 8px; }
+.gap-channel-label { font-size: 12px; color: var(--el-text-color-secondary); }
+.gap-channel-alert { margin-top: 4px; }
+.gap-channel-action { width: 100%; }
+@media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .upload-matrix { grid-template-columns: 1fr; } .step3-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .gap-channel-grid { grid-template-columns: 1fr; } }
 </style>

@@ -179,9 +179,10 @@ def _build_questionnaire_prompt(
     rows: list[dict[str, Any]],
     admin_prompt: str,
     admin_kb: str,
+    user_kb_context: str = "",
     review_feedback: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     indicator_blob = "\n".join(
         f"- id={row['id']} | 一级={row['l1']} / 二级={row['l2']} / 三级={row['l3']}"
         f" | 分值={row['score']:.2f} | 维度={row['tag']}"
@@ -382,6 +383,12 @@ def generate_questionnaire(state: Step6State, runtime: Any = None) -> Step6State
     project_core = str(state.get("project_core_content") or "")
     admin_prompt = read_admin_prompt(context, dict(state))
     admin_kb = read_admin_kb(context, dict(state))
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 资金绩效 支出效率",
+        step_code="step6",
+    )
     review_feedback = (state.get("review_feedback") or "").strip()
 
     prompt = _build_questionnaire_prompt(
@@ -390,6 +397,7 @@ def generate_questionnaire(state: Step6State, runtime: Any = None) -> Step6State
         rows=rows,
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
+        user_kb_context=user_kb_context,
         review_feedback=review_feedback,
     )
 

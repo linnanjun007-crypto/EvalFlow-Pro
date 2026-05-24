@@ -196,8 +196,9 @@ def _build_rubric_prompt(
     admin_prompt: str,
     admin_kb: str,
     review_feedback: str = "",
+    user_kb_context: str = "",
 ) -> str:
-    preamble = build_admin_preamble(admin_prompt, admin_kb)
+    preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
     indicator_blob = "\n".join(
         f"- id={row['id']} | 一级={row['l1_name']} / 二级={row['l2_name']} / 三级={row['l3_name']} | 满分={row['score']:.2f}"
         for row in rows
@@ -379,6 +380,13 @@ def generate_rubrics(state: Step5State, runtime: Any = None) -> Step5State:
     admin_kb = read_admin_kb(context, dict(state))
     review_feedback = (state.get("review_feedback") or "").strip()
 
+    from ._llm import fetch_user_kb_context_sync
+    user_kb_context = fetch_user_kb_context_sync(
+        project_id=str(context.get("project_id") or ""),
+        query=f"{project_name} 评分标准 指标体系",
+        step_code="step5",
+    )
+
     prompt = _build_rubric_prompt(
         project_name=project_name,
         project_core_content=project_core,
@@ -387,6 +395,7 @@ def generate_rubrics(state: Step5State, runtime: Any = None) -> Step5State:
         admin_prompt=admin_prompt,
         admin_kb=admin_kb,
         review_feedback=review_feedback,
+        user_kb_context=user_kb_context,
     )
 
     configs = filter_configs_by_compare_models(

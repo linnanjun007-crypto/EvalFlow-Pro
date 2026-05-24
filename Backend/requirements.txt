@@ -9,3 +9,6 @@ httpx
 python-multipart
 python-docx
 reportlab
+pgvector
+openpyxl
+jieba>=0.42.1

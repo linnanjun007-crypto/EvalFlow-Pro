@@ -29,8 +29,8 @@ export async function getAgentCapabilities() {
   return data
 }
 
-export async function runAgent<T = Record<string, unknown>>(payload: AgentRunRequest) {
-  const { data } = await api.post<AgentRunResponse<T>>('/agent/run', payload)
+export async function runAgent<T = Record<string, unknown>>(payload: AgentRunRequest, options?: { signal?: AbortSignal }) {
+  const { data } = await api.post<AgentRunResponse<T>>('/agent/run', payload, { signal: options?.signal })
   return data
 }
 

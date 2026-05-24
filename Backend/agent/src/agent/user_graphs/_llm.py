@@ -399,15 +399,86 @@ def read_admin_kb(context: dict[str, Any] | None, state: dict[str, Any] | None =
     return ""
 
 
-def build_admin_preamble(prompt: str, kb: str) -> str:
-    """Render admin Prompt + KB blocks for inclusion in the user prompt."""
+def build_admin_preamble(prompt: str, kb: str, user_kb_context: str = "") -> str:
+    """Render admin Prompt + KB + user KB retrieval blocks for inclusion in the user prompt."""
 
     parts: list[str] = []
     if prompt:
         parts.extend(["【管理端 Prompt 配置】", prompt.strip(), ""])
     if kb:
         parts.extend(["【管理端知识库】", kb.strip(), ""])
+    if user_kb_context:
+        parts.extend([user_kb_context.strip(), ""])
     return "\n".join(parts).rstrip() + ("\n\n" if parts else "")
+
+
+def fetch_user_kb_context_sync(
+    *,
+    project_id: str,
+    query: str,
+    step_code: str = "",
+    top_k: int = 5,
+) -> str:
+    """Sync wrapper for retrieve_kb_context. Returns '' on any failure."""
+    if not project_id:
+        return ""
+    try:
+        import asyncio
+
+        from agent.user_graphs._kb_retrieval import retrieve_kb_context
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                return ""
+        except RuntimeError:
+            pass
+
+        return asyncio.run(
+            retrieve_kb_context(
+                project_id=project_id, query=query, top_k=top_k, step_code=step_code
+            )
+        )
+    except Exception:
+        return ""
+
+
+def fetch_kb_chunks_for_step2(
+    *,
+    project_id: str,
+    queries: list[str],
+    top_k_per_query: int = 3,
+    kb_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """同步包装 retrieve_kb_chunks_structured，供 step2 build_core_draft 调用。
+
+    返回: [{"id", "content", "file_name", "chunk_index", "query_source"}, ...]
+    任何异常返回空列表。
+    """
+    if not project_id or not queries:
+        return []
+    try:
+        import asyncio
+
+        from agent.user_graphs._kb_retrieval import retrieve_kb_chunks_structured
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                return []
+        except RuntimeError:
+            pass
+
+        return asyncio.run(
+            retrieve_kb_chunks_structured(
+                project_id=project_id,
+                queries=queries,
+                top_k_per_query=top_k_per_query,
+                kb_ids=kb_ids,
+            )
+        )
+    except Exception:
+        return []
 
 
 __all__ = [
@@ -420,6 +491,8 @@ __all__ = [
     "call_llm_async",
     "collect_errors",
     "ensure_model_configs",
+    "fetch_kb_chunks_for_step2",
+    "fetch_user_kb_context_sync",
     "filter_configs_by_compare_models",
     "first_successful_draft",
     "generate_drafts",

@@ -7,6 +7,7 @@ const route = useRoute()
 const active = computed(() => {
   const p = route.path
   if (p.startsWith('/app/projects')) return '/app/projects'
+  if (p.startsWith('/app/kbs')) return '/app/kbs'
   return p
 })
 </script>
@@ -24,6 +25,7 @@ const active = computed(() => {
 
       <el-menu :default-active="active" router class="menu" background-color="transparent">
         <el-menu-item index="/app/projects"><span>项目列表</span></el-menu-item>
+        <el-menu-item index="/app/kbs"><span>我的知识库</span></el-menu-item>
         <el-menu-item index="/app/history"><span>历史记录</span></el-menu-item>
         <el-menu-item index="/app/usage"><span>用量记录</span></el-menu-item>
         <el-menu-item index="/app/account"><span>个人中心</span></el-menu-item>

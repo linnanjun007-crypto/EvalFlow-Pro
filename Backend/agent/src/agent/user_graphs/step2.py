@@ -59,13 +59,14 @@ class ModelComparison(TypedDict, total=False):
     error: str
 
 
-class SourceIndexEntry(TypedDict):
+class SourceIndexEntry(TypedDict, total=False):
     """Maps distilled statements back to original material snippets."""
 
     ref_id: str
     source_name: str
-    channel: Literal["media", "documents"]
+    channel: Literal["media", "documents", "kb"]
     excerpt: str
+    chunk_index: int
 
 
 class Step2State(TypedDict, total=False):
@@ -291,10 +292,19 @@ def _build_export_filename(project_name: str, export_style: str) -> str:
 def _citation_block(index: list[SourceIndexEntry]) -> str:
     if not index:
         return "（暂无可用索引；请补充资料后重试。）"
-    parts = [
-        f"[{e['ref_id']}]《{e['source_name']}》（通道：{e['channel']}）摘录：{e['excerpt'][:300]}"
-        for e in index
-    ]
+    parts: list[str] = []
+    for e in index:
+        channel = e.get("channel", "")
+        excerpt = (e.get("excerpt") or "")[:300]
+        if channel == "kb":
+            chunk_idx = e.get("chunk_index", 0)
+            parts.append(
+                f"[{e['ref_id']}]《{e['source_name']}》（知识库 · 第{chunk_idx}段）摘录：{excerpt}"
+            )
+        else:
+            parts.append(
+                f"[{e['ref_id']}]《{e['source_name']}》（通道：{channel}）摘录：{excerpt}"
+            )
     return "\n".join(parts)
 
 
@@ -308,17 +318,26 @@ def _build_core_prompt(
     admin_system_prompt: str = "",
     admin_knowledge_base: str = "",
     review_feedback: str = "",
+    user_kb_context: str = "",
 ) -> str:
+    file_count = sum(1 for e in index if e.get("channel") in ("media", "documents"))
+    kb_count = sum(1 for e in index if e.get("channel") == "kb")
+
     task_lines = [
-        "请根据下方双通道资料元数据生成《项目核心内容》。要求：",
+        "请根据下方双通道资料元数据 + 知识库检索结果生成《项目核心内容》。要求：",
         "1. 输出中文 Markdown；",
         "2. 严格围绕本项目展开，剔除与项目无关或重复冗余表述；",
         "3. 按以下分类组织内容（每个分类一个 ### 二级标题）：",
         f"   {'、'.join(categories)}；",
         "4. 必备维度（每个一个 ### 二级标题，与分类章节并列或交叉覆盖，避免遗漏）：",
         f"   {'、'.join(REQUIRED_DIMENSIONS)}；",
-        "5. 每条核心结论尽量在末尾附带索引引用（例如 [S1]、[S2]），引用编号必须取自“索引清单”，不得编造；",
-        "6. 不得编造未在资料中出现的事实、数据、政策依据；",
+        "5. 每条核心结论必须在末尾附带索引引用（例如 [S1]、[S2]），引用编号必须取自“索引清单”，不得编造；",
+        f"   - [S1] 至 [S{file_count}] 为本项目上传文件来源；",
+        (
+            f"   - [S{file_count + 1}] 至 [S{file_count + kb_count}] 为知识库精准检索来源（同一文件可能出现多个段，按 chunk 区分），"
+            "若可证实结论，请优先引用知识库来源以提高准确度；"
+        ) if kb_count > 0 else "   - 当前未命中知识库段落，请基于上传文件来源给出引用；",
+        "6. 不得编造未在资料 / 知识库中出现的事实、数据、政策依据；",
         "7. 内容应条理清晰、逻辑严谨、无自相矛盾；",
         "8. 在末尾输出『## 索引与原文摘录』章节，列出所有引用过的索引条目与原文摘录原文。",
     ]
@@ -327,6 +346,8 @@ def _build_core_prompt(
         parts.extend(["【管理端 Prompt 配置】", admin_system_prompt.strip(), ""])
     if admin_knowledge_base.strip():
         parts.extend(["【管理端知识库】", admin_knowledge_base.strip(), ""])
+    if user_kb_context.strip():
+        parts.extend([user_kb_context.strip(), ""])
     parts.extend(task_lines)
     parts.extend(
         [
@@ -339,7 +360,7 @@ def _build_core_prompt(
             "Word / Excel 等文档通道资料元数据（JSON）：",
             json.dumps(text_meta, ensure_ascii=False, indent=2),
             "",
-            "索引清单（ref_id → 文件 / 摘录）：",
+            "索引清单（ref_id → 文件 / 知识库段 / 摘录）：",
             _citation_block(index),
         ]
     )
@@ -466,6 +487,7 @@ async def _generate_core_drafts_async(
     admin_system_prompt: str,
     admin_knowledge_base: str,
     review_feedback: str,
+    user_kb_context: str = "",
 ) -> list[ModelComparison]:
     prompt = _build_core_prompt(
         project_name,
@@ -476,6 +498,7 @@ async def _generate_core_drafts_async(
         admin_system_prompt=admin_system_prompt,
         admin_knowledge_base=admin_knowledge_base,
         review_feedback=review_feedback,
+        user_kb_context=user_kb_context,
     )
     system_prompt = admin_system_prompt.strip() or "你是严谨的政务/财政绩效评价文档生成助手。"
 
@@ -505,6 +528,7 @@ def _generate_core_drafts(
     admin_system_prompt: str,
     admin_knowledge_base: str,
     review_feedback: str,
+    user_kb_context: str = "",
 ) -> list[ModelComparison]:
     return asyncio.run(
         _generate_core_drafts_async(
@@ -520,6 +544,7 @@ def _generate_core_drafts(
             admin_system_prompt=admin_system_prompt,
             admin_knowledge_base=admin_knowledge_base,
             review_feedback=review_feedback,
+            user_kb_context=user_kb_context,
         )
     )
 
@@ -690,6 +715,42 @@ def build_core_draft(state: Step2State, runtime: Any = None) -> Step2State:
     admin_knowledge_base = str(state.get("admin_knowledge_base") or context.get("admin_knowledge_base") or "")
     review_feedback = str(state.get("review_feedback") or "").strip()
 
+    project_id = str(context.get("project_id") or "")
+
+    from ._llm import fetch_kb_chunks_for_step2, fetch_user_kb_context_sync
+
+    kb_queries: list[str] = []
+    for cat in categories:
+        kb_queries.append(f"{project_name} {cat}")
+    for dim in REQUIRED_DIMENSIONS:
+        kb_queries.append(f"{project_name} {dim}")
+
+    kb_chunks = fetch_kb_chunks_for_step2(
+        project_id=project_id,
+        queries=kb_queries,
+        top_k_per_query=3,
+    )
+
+    if kb_chunks:
+        start_idx = len(index) + 1
+        kb_entries: list[SourceIndexEntry] = []
+        for i, chunk in enumerate(kb_chunks):
+            kb_entries.append({
+                "ref_id": f"S{start_idx + i}",
+                "source_name": str(chunk.get("file_name") or "知识库文档"),
+                "channel": "kb",
+                "excerpt": str(chunk.get("content") or "")[:500],
+                "chunk_index": int(chunk.get("chunk_index") or 0),
+            })
+        index = list(index) + kb_entries
+        user_kb_context = ""
+    else:
+        user_kb_context = fetch_user_kb_context_sync(
+            project_id=project_id,
+            query=f"{project_name} 核心内容 关键信息",
+            step_code="step2",
+        )
+
     fallback = _fallback_core_content(project_name, index, categories, "默认模型")
     export_style = state.get("export_style", "classic")
     export_format = state.get("export_format", "both")
@@ -699,6 +760,7 @@ def build_core_draft(state: Step2State, runtime: Any = None) -> Step2State:
             "core_content_draft": fallback,
             "final_core_content": state.get("final_core_content") or fallback,
             "model_comparisons": [],
+            "source_index": index,
             "export_filename": _build_export_filename(project_name, export_style),
             "export_payload": fallback,
             "export_format": export_format,
@@ -724,12 +786,14 @@ def build_core_draft(state: Step2State, runtime: Any = None) -> Step2State:
             admin_system_prompt=admin_system_prompt,
             admin_knowledge_base=admin_knowledge_base,
             review_feedback=review_feedback,
+            user_kb_context=user_kb_context,
         )
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "core_content_draft": fallback,
             "final_core_content": state.get("final_core_content") or fallback,
             "model_comparisons": [],
+            "source_index": index,
             "export_filename": _build_export_filename(project_name, export_style),
             "export_payload": fallback,
             "export_format": export_format,
@@ -746,6 +810,7 @@ def build_core_draft(state: Step2State, runtime: Any = None) -> Step2State:
             "core_content_draft": fallback,
             "final_core_content": state.get("final_core_content") or fallback,
             "model_comparisons": comparisons,
+            "source_index": index,
             "export_filename": _build_export_filename(project_name, export_style),
             "export_payload": fallback,
             "export_format": export_format,
@@ -771,6 +836,7 @@ def build_core_draft(state: Step2State, runtime: Any = None) -> Step2State:
         "core_content_draft": primary,
         "final_core_content": state.get("final_core_content") or primary,
         "model_comparisons": comparisons,
+        "source_index": index,
         "export_filename": _build_export_filename(project_name, export_style),
         "export_payload": primary,
         "export_format": export_format,

@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useUiStore } from '../stores/ui'
 
 const route = useRoute()
 const router = useRouter()
+const uiStore = useUiStore()
+
+const isWorkflowRoute = computed(() => route.meta.workflow === true)
 
 const isBlankLayout = computed(() => {
   return route.meta.layout === 'blank'
@@ -51,6 +55,16 @@ function logout() {
       </div>
 
       <div class="right">
+        <el-segmented
+          v-if="isWorkflowRoute"
+          :model-value="uiStore.workflowLayout"
+          :options="[
+            { label: '经典', value: 'classic' },
+            { label: 'Hybrid', value: 'hybrid' },
+          ]"
+          size="small"
+          @change="(v: string | number) => uiStore.setWorkflowLayout(v as 'classic' | 'hybrid')"
+        />
         <el-button text class="ghost-link" @click="$router.push('/')">官网首页</el-button>
         <el-button text @click="goProjects">项目</el-button>
         <el-button text @click="$router.push('/admin/dashboard')">管理</el-button>
