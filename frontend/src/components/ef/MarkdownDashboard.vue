@@ -194,7 +194,7 @@ onBeforeUnmount(() => {
     </header>
 
     <div v-if="keyMetrics?.length" class="px-6 py-5">
-      <h4 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">关键数字汇总</h4>
+      <h4 class="text-xs font-semibold text-gray-500 tracking-wide mb-3">关键数字汇总</h4>
       <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
         <div
           v-for="(m, i) in keyMetrics"
@@ -212,7 +212,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="gapItems?.length" class="px-6 py-5 border-t border-gray-100">
-      <h4 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Gap Analysis</h4>
+      <h4 class="text-xs font-semibold text-gray-500 tracking-wide mb-3">差距分析</h4>
       <ul class="space-y-2">
         <li
           v-for="g in gapItems"

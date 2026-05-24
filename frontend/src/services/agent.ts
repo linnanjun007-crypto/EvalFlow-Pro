@@ -38,3 +38,13 @@ export async function cancelAgentRun(runId: string) {
   const { data } = await api.post<{ run_id: string; cancelled: boolean; status: string }>(`/agent/runs/${runId}/cancel`)
   return data
 }
+
+export async function getThreadState(params: { step_code: string; thread_id: string; role?: string }) {
+  const { data } = await api.post<{ thread_id: string; state: Record<string, unknown> | null; found: boolean }>('/agent/state/get', params)
+  return data
+}
+
+export async function updateThreadState(params: { step_code: string; thread_id: string; values: Record<string, unknown>; role?: string }) {
+  const { data } = await api.post<{ thread_id: string; updated: boolean; keys: string[] }>('/agent/state/update', params)
+  return data
+}

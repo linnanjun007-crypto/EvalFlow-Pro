@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch, watchEffect } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import type { UploadFile, UploadProps } from 'element-plus'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import PageHeader from '../../components/ef/PageHeader.vue'
 import StepSidebar from '../../components/ef/StepSidebar.vue'
 import GenerationPanel from '../../components/ef/GenerationPanel.vue'
@@ -12,8 +12,8 @@ import ChatDrawer from '../../components/ef/ChatDrawer.vue'
 import TaskProgress from '../../components/ef/TaskProgress.vue'
 import Step1Analysis from '../../components/ef/Step1Analysis.vue'
 import MarkdownDashboard from '../../components/ef/MarkdownDashboard.vue'
-import { ElMessage } from 'element-plus'
-import { cancelAgentRun, runAgent, type AgentRunResponse } from '../../services/agent'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { cancelAgentRun, runAgent, updateThreadState, type AgentRunResponse } from '../../services/agent'
 import { useWorkflowBus } from '../../stores/workflowBus'
 
 const props = withDefaults(defineProps<{ embeddedMode?: boolean }>(), { embeddedMode: false })
@@ -107,6 +107,9 @@ const step2SourceIndex = ref<Array<{ ref_id: string; source_name: string; channe
 const step2MediaMetadata = ref<Array<Record<string, unknown>>>([])
 const step2DocsMetadata = ref<Array<Record<string, unknown>>>([])
 const step2StatusText = ref('')
+const step2DraftDirty = ref(false)
+const step2LastCommittedAt = ref<string | null>(null)
+let step2WriteBackTimer: ReturnType<typeof setTimeout> | null = null
 const step2DigestViewMode = ref<'raw' | 'preview'>('raw')
 const step2ActiveCompareIndex = ref(0)
 const step2CompareViewMode = ref<'raw' | 'preview'>('raw')
@@ -409,7 +412,13 @@ const activeModelSummary = computed(() => enabledActiveModelConfigs.value.length
 const steps = computed(() => Array.from({ length: workflowStatus.value?.total_steps ?? 14 }, (_, i) => {
   const id = i + 1
   const item = workflowStatus.value?.steps.find((statusItem) => statusItem.step_code === `step${id}`)
-  return { id, title: `Step ${id}`, done: Boolean(item?.done) }
+  const shortTitles: Record<number, string> = {
+    1: '项目资料清单', 2: '有效项目资料', 3: '指标体系', 4: '生成分值',
+    5: '评分标准', 6: '现场评价表', 7: '得分与分析', 8: '经验做法',
+    9: '问题及原因', 10: '整改建议', 11: '综合分析', 12: '基础信息',
+    13: '工作情况', 14: '评价报告',
+  }
+  return { id, title: shortTitles[id] ?? `Step ${id}`, done: Boolean(item?.done) }
 }))
 const taskProgress = computed(() => ({
   status: workflowStatus.value?.status ?? 'queued',
@@ -468,6 +477,85 @@ function isVisionCapableModel(config: { label?: string; model_name?: string }) {
 
 function goStep(n: number) {
   router.push({ path: `/app/projects/${projectId.value}/workflow/${n}`, query: { step: String(n) } })
+}
+
+const currentStepSections = computed<Array<{ id: string; label: string }>>(() => {
+  const sid = stepId.value
+  const common = [{ id: 'sec-model-config', label: '客户端模型配置' }]
+  if (sid === 1) {
+    return [
+      ...common,
+      { id: 'sec-step1-input', label: '输入资料与草稿' },
+      { id: 'sec-step1-draft', label: '草稿编辑' },
+      { id: 'sec-step1-analysis', label: '结构化分析' },
+      { id: 'sec-step1-history', label: '草稿版本历史' },
+      { id: 'sec-step1-export', label: '成果区与导出' },
+      { id: 'sec-artifact-editor', label: '最终成品编辑' },
+      { id: 'sec-backend-result', label: '后端结果' },
+    ]
+  }
+  if (sid === 2) {
+    return [
+      ...common,
+      { id: 'sec-step2-upload', label: '资料上传' },
+      { id: 'sec-step2-categories', label: '资料分类管理' },
+      { id: 'sec-step2-models', label: '通道模型选择' },
+      { id: 'sec-step2-digest', label: '校验摘要' },
+      { id: 'sec-step2-compare', label: '多模型对比' },
+      { id: 'sec-step2-review', label: '复核与精修' },
+      { id: 'sec-step2-export', label: '导出成品' },
+      { id: 'sec-artifact-editor', label: '最终成品编辑' },
+      { id: 'sec-backend-result', label: '后端结果' },
+    ]
+  }
+  if (sid === 3) {
+    const phase = step3SkeletonPhase.value
+    const list = [...common]
+    if (phase === 'config') list.push({ id: 'sec-step3-config', label: '指标体系配置' })
+    if (phase === 'skeleton' || phase === 'generating_l3') list.push({ id: 'sec-step3-skeleton', label: '骨架管理' })
+    if (phase === 'generating_l3') list.push({ id: 'sec-step3-l3', label: '三级指标生成' })
+    if (phase === 'completed') list.push({ id: 'sec-step3-finalize', label: '收尾与定稿' })
+    list.push({ id: 'sec-artifact-editor', label: '最终成品编辑' })
+    list.push({ id: 'sec-backend-result', label: '后端结果' })
+    return list
+  }
+  if (sid === 4) {
+    return [
+      ...common,
+      { id: 'sec-step4-scoring', label: '分值配置' },
+      { id: 'sec-artifact-editor', label: '最终成品编辑' },
+      { id: 'sec-backend-result', label: '后端结果' },
+    ]
+  }
+  if (sid === 9) {
+    return [
+      ...common,
+      { id: 'sec-step9-style', label: '评价结论与语气' },
+      { id: 'sec-artifact-editor', label: '最终成品编辑' },
+      { id: 'sec-backend-result', label: '后端结果' },
+    ]
+  }
+  if (sid === 14) {
+    return [
+      ...common,
+      { id: 'sec-step14-export', label: '评价报告与导出' },
+      { id: 'sec-artifact-editor', label: '最终成品编辑' },
+      { id: 'sec-backend-result', label: '后端结果' },
+    ]
+  }
+  return [
+    ...common,
+    { id: 'sec-stepN-prev', label: '上一步内容' },
+    { id: 'sec-artifact-editor', label: '最终成品编辑' },
+    { id: 'sec-backend-result', label: '后端结果' },
+  ]
+})
+
+function scrollToSection(sectionId: string) {
+  const el = document.getElementById(sectionId)
+  if (!el) return
+  const top = el.getBoundingClientRect().top + window.scrollY - 80
+  window.scrollTo({ top, behavior: 'smooth' })
 }
 
 function stepCodeOf(value = stepId.value) {
@@ -1009,6 +1097,8 @@ async function loadResult() {
           ? (step2Result.model_comparisons as Array<{ model_name?: string; label?: string; provider?: string; channel?: string; temperature?: number; draft?: string; error?: string }>)
           : []
         extractStep2State(step2Result, comparisons)
+        step2DraftDirty.value = false
+        step2LastCommittedAt.value = (res as { updated_at?: string }).updated_at || step2LastCommittedAt.value
       }
     } catch {
       // step2 not generated yet
@@ -1239,9 +1329,54 @@ async function approveStep2() {
     ElMessage.warning('请先生成或编辑 Step2 核心内容，再确认定稿')
     return
   }
-  step2ReviewMode.value = 'approve'
-  step2ReviewFeedback.value = ''
-  await runStep('')
+  openConfirmDialog({
+    title: '确认提交 Step2 核心内容',
+    message: '是否确认把当前 Step2 核心内容提交为最终版本？提交后将写入数据库。',
+    type: 'warning',
+    okText: '确认提交',
+    action: async () => {
+      saving.value = true
+      try {
+        await updateThreadState({
+          step_code: 'step2',
+          thread_id: step2ThreadId.value,
+          values: { final_core_content: editor.value, status: 'committed' },
+        })
+        await saveStepResult('step2', {
+          project_id: projectId.value,
+          title: titleMap[2],
+          content_text: editor.value,
+          content_json: resultText.value || '{}',
+          model_name: 'manual-edit',
+        })
+        step2DraftDirty.value = false
+        step2LastCommittedAt.value = new Date().toISOString()
+        step2ReviewMode.value = 'approve'
+        step2ReviewFeedback.value = ''
+        await loadWorkflowStatus()
+        ElMessage.success('Step2 核心内容已确认提交到数据库')
+      } catch (e) {
+        ElMessage.error(e instanceof Error ? e.message : '提交失败')
+      } finally {
+        saving.value = false
+      }
+    },
+  })
+}
+
+function step2WriteBackToCheckpointer() {
+  if (stepId.value !== 2) return
+  if (step2WriteBackTimer) clearTimeout(step2WriteBackTimer)
+  step2WriteBackTimer = setTimeout(async () => {
+    if (stepId.value !== 2 || isEditorEmpty()) return
+    try {
+      await updateThreadState({
+        step_code: 'step2',
+        thread_id: step2ThreadId.value,
+        values: { final_core_content: editor.value },
+      })
+    } catch { /* silent */ }
+  }, 2000)
 }
 
 function getStep2ExportContent() {
@@ -1338,6 +1473,7 @@ function applyAgentResult(res: AgentRunResponse) {
   }))
   if (stepId.value === 2) {
     extractStep2State(currentResult.value, comparisons)
+    step2DraftDirty.value = true
   }
 
   if (stepId.value === 4 && currentResult.value) {
@@ -2416,9 +2552,43 @@ watch(stepId, async () => {
   await loadResult()
 }, { immediate: true })
 
+watch(editor, (val) => {
+  if (stepId.value === 2 && !isEditorEmpty(val)) {
+    step2DraftDirty.value = true
+    step2WriteBackToCheckpointer()
+  }
+})
+
 onMounted(() => {
   loadResult()
   loadStep1DraftIntoEditor()
+  window.addEventListener('beforeunload', onBeforeUnloadGuard)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', onBeforeUnloadGuard)
+  if (step2WriteBackTimer) clearTimeout(step2WriteBackTimer)
+})
+
+function onBeforeUnloadGuard(e: BeforeUnloadEvent) {
+  if (stepId.value === 2 && step2DraftDirty.value) {
+    e.preventDefault()
+    e.returnValue = ''
+  }
+}
+
+onBeforeRouteLeave(async () => {
+  if (stepId.value !== 2 || !step2DraftDirty.value) return true
+  try {
+    await ElMessageBox.confirm(
+      '当前 Step2 内容仅存于 LangGraph 短期记忆，未提交到数据库。离开后下次回到本步骤可继续编辑，但未确认前不会出现在历史版本中。',
+      'Step2 草稿未提交',
+      { confirmButtonText: '仍然离开', cancelButtonText: '留下继续编辑', type: 'warning' },
+    )
+    return true
+  } catch {
+    return false
+  }
 })
 
 watchEffect(() => {
@@ -2461,7 +2631,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
     </PageHeader>
 
     <div class="layout" :class="{ 'layout--no-sidebar': props.embeddedMode }">
-      <StepSidebar v-if="!props.embeddedMode" :steps="steps" :active-step="stepId" @select="goStep" />
+      <StepSidebar v-if="!props.embeddedMode" :steps="steps" :active-step="stepId" :sections="currentStepSections" @select="goStep" @scroll-to="scrollToSection" />
 
       <div class="center">
         <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="mb" />
@@ -2475,7 +2645,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             @stop="stopCurrentRun"
           />
 
-          <el-card shadow="never">
+          <el-card id="sec-model-config" shadow="never">
             <template #header>客户端模型配置</template>
             <el-alert
               type="success"
@@ -2562,7 +2732,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
 
           <el-alert v-if="!canGenerate" type="warning" :closable="false" show-icon title="请先上传项目资料，并配置客户端模型 API Key、Base URL 和模型名。" />
 
-          <el-card v-if="stepId === 1" shadow="never">
+          <el-card id="sec-step1-input" v-if="stepId === 1" shadow="never">
             <template #header>Step1 输入资料与草稿</template>
             <el-alert
               type="info"
@@ -2589,7 +2759,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </el-table>
           </el-card>
 
-          <el-card v-if="stepId === 1" shadow="never">
+          <el-card id="sec-step1-draft" v-if="stepId === 1" shadow="never">
             <template #header>
               <div class="card-head-with-toggle">
                 <span>Step1 草稿编辑</span>
@@ -2634,8 +2804,8 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             />
           </el-card>
 
-          <el-card v-if="stepId === 1" shadow="never">
-            <template #header>Step1 结构化分析（Three-Table View）</template>
+          <el-card id="sec-step1-analysis" v-if="stepId === 1" shadow="never">
+            <template #header>Step1 结构化分析（三表视图）</template>
             <Step1Analysis
               :key-metrics="step1StructuredAnalysis.keyMetrics"
               :gap-analysis="step1StructuredAnalysis.gapAnalysis"
@@ -2643,7 +2813,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             />
           </el-card>
 
-          <el-card v-if="stepId === 1" shadow="never">
+          <el-card id="sec-step1-history" v-if="stepId === 1" shadow="never">
             <template #header>Step1 未提交资料清单版本</template>
             <el-alert
               type="info"
@@ -2692,7 +2862,20 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </template>
           </el-card>
 
-          <el-card v-if="stepId === 2" shadow="never">
+          <el-alert
+            v-if="stepId === 2 && step2HasContent"
+            :type="step2DraftDirty ? 'warning' : 'success'"
+            :closable="false"
+            show-icon
+            class="mb"
+          >
+            <template #title>
+              <span v-if="step2DraftDirty">Step2 草稿已生成 · 暂存于 LangGraph 短期记忆 · 未提交到数据库</span>
+              <span v-else>Step2 内容已提交到数据库<span v-if="step2LastCommittedAt">（{{ new Date(step2LastCommittedAt).toLocaleString('zh-CN') }}）</span></span>
+            </template>
+          </el-alert>
+
+          <el-card id="sec-step2-upload" v-if="stepId === 2" shadow="never">
             <template #header>Step2 资料上传窗口与通道确认</template>
             <el-alert
               type="info"
@@ -2724,7 +2907,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             <el-alert v-if="!step2HasFiles" type="warning" :closable="false" show-icon title="请先上传资料，再执行 Step2 生成。" />
           </el-card>
 
-          <el-card v-if="stepId === 2" shadow="never">
+          <el-card id="sec-step2-models" v-if="stepId === 2" shadow="never">
             <template #header>Step2 每通道模型绑定</template>
             <el-alert
               type="info"
@@ -2755,7 +2938,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </el-form>
           </el-card>
 
-          <el-card v-if="stepId === 2" shadow="never">
+          <el-card id="sec-step2-categories" v-if="stepId === 2" shadow="never">
             <template #header>Step2 分类管理</template>
             <el-alert
               type="info"
@@ -2807,7 +2990,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             />
           </el-card>
 
-          <el-card v-if="stepId === 2 && (step2VerificationDigest || step2ParseWarnings.length || step2MediaMetadata.length || step2DocsMetadata.length)" shadow="never">
+          <el-card id="sec-step2-digest" v-if="stepId === 2 && (step2VerificationDigest || step2ParseWarnings.length || step2MediaMetadata.length || step2DocsMetadata.length)" shadow="never">
             <template #header>Step2 资料识别校验</template>
             <el-alert
               v-for="(item, idx) in step2ParseWarnings"
@@ -2863,7 +3046,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
 
           <ModelCompareTabs v-if="stepId === 2 && compareItems.length" :items="compareItems" />
 
-          <el-card v-if="stepId === 2 && step2ModelComparisons.length" shadow="never">
+          <el-card id="sec-step2-compare" v-if="stepId === 2 && step2ModelComparisons.length" shadow="never">
             <template #header>Step2 多模型对比</template>
             <el-alert
               type="info"
@@ -2909,7 +3092,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </div>
           </el-card>
 
-          <el-card v-if="stepId === 2" shadow="never">
+          <el-card id="sec-step2-review" v-if="stepId === 2" shadow="never">
             <template #header>Step2 人机交互精修</template>
             <el-alert
               type="info"
@@ -2931,7 +3114,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </el-form>
             <div class="upload-toolbar">
               <el-button type="primary" :loading="loading" :disabled="!step2CanRefine" @click="submitStep2Refinement">让 AI 重新打磨核心内容</el-button>
-              <el-button type="success" :loading="loading" @click="approveStep2">确认核心内容定稿并保存</el-button>
+              <el-button type="success" :loading="saving" @click="approveStep2">确认提交到数据库</el-button>
               <el-button @click="chatOpen = true">打开 AI 对话深度精修</el-button>
             </div>
             <el-alert
@@ -2944,7 +3127,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             />
           </el-card>
 
-          <el-card v-if="stepId === 2" shadow="never">
+          <el-card id="sec-step2-export" v-if="stepId === 2" shadow="never">
             <template #header>Step2 成果区与导出</template>
             <el-alert
               type="success"
@@ -2961,7 +3144,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
 
           <ModelCompareTabs v-if="compareItems.length && stepId === 3" :items="compareItems" />
           <!-- Step3: 配置阶段 -->
-          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'config'" shadow="never">
+          <el-card id="sec-step3-config" v-if="stepId === 3 && step3SkeletonPhase === 'config'" shadow="never">
             <template #header>Step3 · 指标体系配置</template>
             <el-alert v-if="!step3State?.core_basis_digest && !step3State?.project_core_content" type="warning" :closable="false" show-icon title="当前尚未读取到 Step2 核心内容，请先确保 Step2 已定稿并保存。" />
             <el-alert v-else type="success" :closable="false" show-icon class="mb" title="已读取 Step2 核心内容，下方配置完成后即可构建指标体系。" />
@@ -3060,7 +3243,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step3: 骨架编辑 & L3 生成阶段 -->
-          <el-card v-if="stepId === 3 && (step3SkeletonPhase === 'skeleton' || step3SkeletonPhase === 'generating_l3')" shadow="never">
+          <el-card id="sec-step3-skeleton" v-if="stepId === 3 && (step3SkeletonPhase === 'skeleton' || step3SkeletonPhase === 'generating_l3')" shadow="never">
             <template #header>Step3 · 指标体系骨架管理</template>
             <el-alert type="success" :closable="false" show-icon class="mb" title="骨架已就绪，可增删改一级/二级指标，调整三级数量，然后逐个生成三级指标与解释。" />
             <el-alert
@@ -3118,7 +3301,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step3: 逐个二级指标生成三级指标 -->
-          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3' && step3ActiveL2Task" shadow="never">
+          <el-card id="sec-step3-l3" v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3' && step3ActiveL2Task" shadow="never">
             <template #header>
               Step3 · 三级指标生成 —
               当前：{{ step3ActiveL2Task.level1_name }} → {{ step3ActiveL2Task.level2_name }}
@@ -3230,7 +3413,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step3: 完成阶段 -->
-          <el-card v-if="stepId === 3 && step3SkeletonPhase === 'completed'" shadow="never">
+          <el-card id="sec-step3-finalize" v-if="stepId === 3 && step3SkeletonPhase === 'completed'" shadow="never">
             <template #header>Step3 · 指标体系已完成</template>
             <el-alert type="success" :closable="false" show-icon class="mb" title="全部二级指标的三级指标与解释已处理完毕，可进入定稿环节。" />
             <div class="step3-summary-grid">
@@ -3311,7 +3494,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-dialog>
 
           <!-- Step4: 赋分 -->
-          <el-card v-if="stepId === 4" shadow="never">
+          <el-card id="sec-step4-scoring" v-if="stepId === 4" shadow="never">
             <template #header>Step4 · 生成分值</template>
             <el-alert v-if="!step4FlatL2Tasks.length" type="warning" :closable="false" show-icon title="未读取到 Step3 指标体系数据，请确保 Step3 已完成并保存。" />
             <template v-else>
@@ -3375,7 +3558,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step5: 评分标准 -->
-          <el-card v-if="stepId === 5" shadow="never">
+          <el-card id="sec-stepN-prev" v-if="stepId === 5" shadow="never">
             <template #header>Step5 · 评分标准</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step4 赋分结果，请确保 Step4 已完成并保存。" />
             <el-alert v-else type="info" :closable="false" show-icon class="mb" title="基于 Step4 赋分结果，生成各指标的详细评分标准。" />
@@ -3390,7 +3573,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step6~8, Step10~13: 通用步骤 -->
-          <el-card v-if="stepId >= 6 && stepId <= 8 || stepId >= 10 && stepId <= 13" shadow="never">
+          <el-card id="sec-stepN-prev" v-if="stepId >= 6 && stepId <= 8 || stepId >= 10 && stepId <= 13" shadow="never">
             <template #header>{{ titleMap[stepId] ?? `Step${stepId}` }}</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon :title="`未读取到 Step${stepId - 1} 结果，请确保上一步已完成并保存。`" />
             <el-alert v-else type="info" :closable="false" show-icon class="mb" :title="`基于 Step${stepId - 1} 输出内容继续生成。`" />
@@ -3414,7 +3597,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step9: 评价结论 + 风格 -->
-          <el-card v-if="stepId === 9" shadow="never">
+          <el-card id="sec-step9-style" v-if="stepId === 9" shadow="never">
             <template #header>Step9 · 评价结论</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step8 结果，请确保上一步已完成并保存。" />
             <el-alert v-else type="info" :closable="false" show-icon class="mb" title="根据前序步骤内容生成评价结论，可选择结论语气风格。" />
@@ -3447,7 +3630,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step14: 评价报告 + 导出 -->
-          <el-card v-if="stepId === 14" shadow="never">
+          <el-card id="sec-step14-export" v-if="stepId === 14" shadow="never">
             <template #header>Step14 · 评价报告</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step13 结果，请确保上一步已完成并保存。" />
             <el-alert v-else type="info" :closable="false" show-icon class="mb" title="汇总所有步骤结果，生成最终评价报告。完成后可导出 Markdown 或 Word 文档。" />
@@ -3478,7 +3661,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Existing step1 cards -->
-          <el-card v-if="stepId === 1" shadow="never">
+          <el-card id="sec-step1-export" v-if="stepId === 1" shadow="never">
             <template #header>Step1 成果区与导出</template>
             <el-alert
               type="success"
@@ -3491,7 +3674,8 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
               <el-button type="warning" :loading="exportSaving" @click="openStep1ExportDialog">成果导出</el-button>
             </div>
           </el-card>
-                    <ArtifactEditor
+          <div id="sec-artifact-editor">
+            <ArtifactEditor
             v-model="editor"
             :title="titleMap[stepId] ?? `Step ${stepId}`"
             :tag="stepId === 3 ? 'Step3 定稿区' : (currentResult?.status ? String(currentResult.status) : '最终版本')"
@@ -3504,7 +3688,8 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             @request-upload="onRequestUpload"
             @step-click="goStep"
           />
-          <el-card shadow="never">
+          </div>
+          <el-card id="sec-backend-result" shadow="never">
             <template #header>后端结果</template>
             <el-skeleton v-if="loading" :rows="4" animated />
             <template v-else>
@@ -3894,6 +4079,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
 .layout--no-sidebar { grid-template-columns: minmax(0, 1fr) 260px; }
 .center { min-width: 0; }
 .stack { display: grid; gap: 12px; }
+.stack [id^="sec-"] { scroll-margin-top: 84px; }
 .placeholder { padding: 20px; }
 .side { display: grid; gap: 12px; }
 .mb { margin-bottom: 12px; }

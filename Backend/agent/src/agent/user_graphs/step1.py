@@ -529,13 +529,36 @@ def _read_model_configs(context: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _extract_openai_compatible_content(data: Any) -> str:
-    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError(f"模型接口返回非 JSON 对象: {str(data)[:200]}")
+
+    # Handle Responses API format (output[].content[].text)
+    output_list = data.get("output")
+    if isinstance(output_list, list):
+        for output_item in output_list:
+            if not isinstance(output_item, dict) or output_item.get("type") != "message":
+                continue
+            content_parts = output_item.get("content")
+            if isinstance(content_parts, list):
+                texts = [p.get("text", "") for p in content_parts if isinstance(p, dict) and p.get("type") == "output_text"]
+                joined = "".join(texts).strip()
+                if joined:
+                    return joined
+
+    # Standard Chat Completions format
+    choices = data.get("choices")
     if not choices:
-        raise RuntimeError("模型接口未返回 choices")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
+        raise RuntimeError(f"模型接口未返回 choices 或 output: keys={list(data.keys())}")
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict):
+        raise RuntimeError(f"choices[0].message 格式异常: {str(first)[:200]}")
+    content = message.get("content")
+    # Some reasoning models put content in refusal or reasoning_content when content is null
+    if not content:
+        content = message.get("refusal") or message.get("reasoning_content") or ""
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("模型接口未返回有效 content")
+        raise RuntimeError(f"模型返回空 content, message keys={list(message.keys())}")
     return content.strip()
 
 
@@ -573,7 +596,7 @@ def _call_openai_compatible_model(
     model_name: str,
     prompt: str,
     temperature: float = 0.2,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float = 180.0,
     system_prompt: str = "",
 ) -> str:
     endpoint, headers, payload = _build_openai_compatible_request(
@@ -586,8 +609,13 @@ def _call_openai_compatible_model(
     )
     with httpx.Client(timeout=timeout_seconds) as client:
         response = client.post(endpoint, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        if response.status_code >= 400:
+            body_text = response.text[:500] if response.text else ""
+            raise RuntimeError(f"HTTP {response.status_code} 调用 {endpoint}: {body_text}")
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"模型接口返回非 JSON: {response.text[:300]}") from exc
     return _extract_openai_compatible_content(data)
 
 
@@ -598,7 +626,7 @@ async def _call_openai_compatible_model_async(
     model_name: str,
     prompt: str,
     temperature: float = 0.2,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float = 180.0,
     system_prompt: str = "",
 ) -> str:
     endpoint, headers, payload = _build_openai_compatible_request(
@@ -611,8 +639,13 @@ async def _call_openai_compatible_model_async(
     )
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.post(endpoint, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        if response.status_code >= 400:
+            body_text = response.text[:500] if response.text else ""
+            raise RuntimeError(f"HTTP {response.status_code} 调用 {endpoint}: {body_text}")
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"模型接口返回非 JSON: {response.text[:300]}") from exc
     return _extract_openai_compatible_content(data)
 
 

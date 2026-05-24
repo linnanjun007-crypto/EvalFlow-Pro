@@ -316,3 +316,60 @@ async def run_agent(payload: dict[str, Any] = Body(...), user_id: str = Depends(
         'result': result,
         'memory_scope': memory_scope,
     }
+
+
+@router.post('/state/get')
+async def get_thread_state(
+    payload: dict[str, Any] = Body(...),
+    user_id: str = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    """Read the current checkpointer state for a given thread."""
+    step_code = str(payload.get('step_code') or 'step2').lower().strip()
+    role = str(payload.get('role') or 'client').lower().strip()
+    thread_id = str(payload.get('thread_id') or '')
+    if not thread_id:
+        raise HTTPException(status_code=400, detail='thread_id is required')
+
+    from app.integrations.agent_runner import _load_graph
+    graph = _load_graph(role, step_code)
+    if graph is None:
+        raise HTTPException(status_code=404, detail=f'graph not found: {role}/{step_code}')
+
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = graph.get_state(config)
+    except Exception:
+        return {'thread_id': thread_id, 'state': None, 'found': False}
+
+    values = state.values if state else {}
+    safe_values = {k: v for k, v in values.items() if k != 'messages'}
+    return {'thread_id': thread_id, 'state': safe_values, 'found': bool(values)}
+
+
+@router.post('/state/update')
+async def update_thread_state(
+    payload: dict[str, Any] = Body(...),
+    user_id: str = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    """Write partial state back to the checkpointer without running graph nodes."""
+    step_code = str(payload.get('step_code') or 'step2').lower().strip()
+    role = str(payload.get('role') or 'client').lower().strip()
+    thread_id = str(payload.get('thread_id') or '')
+    values = payload.get('values') or {}
+    if not thread_id:
+        raise HTTPException(status_code=400, detail='thread_id is required')
+    if not values:
+        raise HTTPException(status_code=400, detail='values is required')
+
+    from app.integrations.agent_runner import _load_graph
+    graph = _load_graph(role, step_code)
+    if graph is None:
+        raise HTTPException(status_code=404, detail=f'graph not found: {role}/{step_code}')
+
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        graph.update_state(config, values)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'update_state failed: {exc}') from exc
+
+    return {'thread_id': thread_id, 'updated': True, 'keys': list(values.keys())}

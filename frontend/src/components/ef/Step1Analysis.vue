@@ -44,7 +44,7 @@ const metricIcons: Record<string, string> = {
   <div class="space-y-6">
     <!-- Table A: Key Metrics -->
     <section>
-      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide uppercase">Table A · Key Metrics（关键数字）</h4>
+      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide">表 A · 关键数字</h4>
       <div v-if="keyMetrics.length" class="overflow-hidden rounded-xl border border-gray-200">
         <table class="w-full text-sm">
           <thead class="bg-gray-50">
@@ -74,7 +74,7 @@ const metricIcons: Record<string, string> = {
 
     <!-- Table B: Gap Analysis -->
     <section>
-      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide uppercase">Table B · Gap Analysis（差距分析）</h4>
+      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide">表 B · 差距分析</h4>
       <div v-if="gapAnalysis.length" class="overflow-hidden rounded-xl border border-gray-200">
         <table class="w-full text-sm">
           <thead class="bg-gray-50">
@@ -104,7 +104,7 @@ const metricIcons: Record<string, string> = {
 
     <!-- Table C: Data Flow -->
     <section>
-      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide uppercase">Table C · Data Flow（Step 联动）</h4>
+      <h4 class="text-sm font-semibold text-gray-700 mb-3 tracking-wide">表 C · 步骤联动</h4>
       <div v-if="dataFlow.length" class="overflow-hidden rounded-xl border border-gray-200">
         <table class="w-full text-sm">
           <thead class="bg-gray-50">

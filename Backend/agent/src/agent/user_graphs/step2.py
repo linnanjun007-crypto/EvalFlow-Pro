@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -34,6 +35,8 @@ import re
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
+logger = logging.getLogger(__name__)
 
 from .step1 import (
     DocumentItem,
@@ -468,9 +471,18 @@ async def _call_model_async(
             temperature=_normalize_temperature(config.get("temperature")),
             system_prompt=system_prompt or "你是严谨的政务/财政绩效评价文档生成助手。",
         )
+        if not draft or not draft.strip():
+            return {**base_result, "draft": "", "error": "模型返回了空字符串"}
         return {**base_result, "draft": draft}
     except Exception as exc:  # pragma: no cover - network errors
-        return {**base_result, "draft": "", "error": str(exc)}
+        err_msg = str(exc) or repr(exc) or type(exc).__name__
+        logger.warning(
+            "step2 model call failed model=%s base_url=%s error=%s",
+            config.get("model_name"),
+            config.get("base_url"),
+            err_msg,
+        )
+        return {**base_result, "draft": "", "error": err_msg}
 
 
 async def _generate_core_drafts_async(
