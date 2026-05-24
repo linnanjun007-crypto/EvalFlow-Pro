@@ -51,12 +51,20 @@ class KbService:
         d["chunk_count"] = chunk_count
         return d
 
-    def update_kb(self, kb_id: str, user_id: str, name: str | None = None, description: str | None = None) -> dict[str, Any]:
+    def update_kb(self, kb_id: str, user_id: str, **kwargs: Any) -> dict[str, Any]:
         kb = self._get_owned(kb_id, user_id)
-        if name is not None:
-            kb.name = name.strip() or kb.name
-        if description is not None:
-            kb.description = description or None
+        updatable = (
+            "name", "description", "chunk_size", "chunk_overlap",
+            "enable_bm25", "enable_rerank", "rrf_k",
+            "pdf_enhanced_parse", "processing_mode", "chunk_strategy",
+            "index_title", "index_image", "auto_supplement_index", "param_preset",
+        )
+        for key in updatable:
+            val = kwargs.get(key)
+            if val is not None:
+                if key == "name":
+                    val = val.strip() or kb.name
+                setattr(kb, key, val)
         self.db.commit()
         self.db.refresh(kb)
         return self._kb_to_dict(kb)
@@ -135,6 +143,63 @@ class KbService:
 
     # --- 项目绑定 ---
 
+    def get_document_content(self, doc_id: str, user_id: str) -> dict[str, Any]:
+        """获取文档全文和分段结构。"""
+        from app.services.chunking_service import chunk_document
+        from app.services.file_parser import parse_file_full
+
+        doc = self.db.get(KbDocument, doc_id)
+        if not doc:
+            raise ValueError("文档不存在")
+        self._get_owned(doc.kb_id, user_id)
+
+        text, file_type = parse_file_full(doc.storage_key)
+        total_length = len(text)
+        max_len = 1_000_000
+        truncated = total_length > max_len
+        display_text = text[:max_len] if truncated else text
+
+        kb = self.db.get(UserKnowledgeBase, doc.kb_id)
+        chunks = chunk_document(
+            display_text,
+            file_type=file_type,
+            chunk_size=kb.chunk_size if kb else 500,
+            chunk_overlap=kb.chunk_overlap if kb else 80,
+        )
+        sections = [
+            {"heading_path": c.get("metadata", {}).get("heading_path", []), "content": c["content"]}
+            for c in chunks
+        ]
+
+        return {
+            "file_name": doc.file_name,
+            "file_type": doc.file_type,
+            "raw_text": display_text,
+            "sections": sections,
+            "total_length": total_length,
+            "truncated": truncated,
+        }
+
+    def preview_chunks(
+        self, doc_id: str, user_id: str, *, chunk_size: int = 500, chunk_overlap: int = 80
+    ) -> dict[str, Any]:
+        """用指定参数预览分段效果（不写库）。"""
+        from app.services.chunking_service import chunk_document
+        from app.services.file_parser import parse_file_full
+
+        doc = self.db.get(KbDocument, doc_id)
+        if not doc:
+            raise ValueError("文档不存在")
+        self._get_owned(doc.kb_id, user_id)
+
+        text, file_type = parse_file_full(doc.storage_key)
+        chunks = chunk_document(text, file_type=file_type, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        items = [
+            {"chunk_index": c["chunk_index"], "content": c["content"], "char_count": len(c["content"])}
+            for c in chunks[:50]
+        ]
+        return {"items": items, "total": len(chunks)}
+
     def list_project_kbs(self, project_id: str, user_id: str) -> list[dict[str, Any]]:
         bindings = self.db.scalars(
             select(ProjectKnowledgeBase).where(ProjectKnowledgeBase.project_id == project_id)
@@ -178,6 +243,13 @@ class KbService:
             "enable_bm25": kb.enable_bm25,
             "enable_rerank": kb.enable_rerank,
             "rrf_k": kb.rrf_k,
+            "pdf_enhanced_parse": kb.pdf_enhanced_parse,
+            "processing_mode": kb.processing_mode,
+            "chunk_strategy": kb.chunk_strategy,
+            "index_title": kb.index_title,
+            "index_image": kb.index_image,
+            "auto_supplement_index": kb.auto_supplement_index,
+            "param_preset": kb.param_preset,
             "created_at": kb.created_at.isoformat() if kb.created_at else None,
             "updated_at": kb.updated_at.isoformat() if kb.updated_at else None,
         }

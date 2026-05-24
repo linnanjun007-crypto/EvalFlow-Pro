@@ -6,12 +6,10 @@ import ProjectListPage from '../pages/app/ProjectListPage.vue'
 import ProjectCreatePage from '../pages/app/ProjectCreatePage.vue'
 import ProjectOverviewPage from '../pages/app/ProjectOverviewPage.vue'
 import WorkflowRouter from '../pages/app/WorkflowRouter.vue'
-import HistoryCenterPage from '../pages/app/HistoryCenterPage.vue'
-import UsagePage from '../pages/app/UsagePage.vue'
 import AccountPage from '../pages/app/AccountPage.vue'
-import DownloadsPage from '../pages/app/DownloadsPage.vue'
 import ConversationPage from '../pages/app/ConversationPage.vue'
 import PersonalKbPage from '../pages/app/PersonalKbPage.vue'
+import KbDocDetailPage from '../pages/app/KbDocDetailPage.vue'
 
 import AdminShellPage from '../pages/admin/AdminShellPage.vue'
 import AdminDashboardPage from '../pages/admin/AdminDashboardPage.vue'
@@ -87,24 +85,9 @@ const routes: RouteRecordRaw[] = [
         meta: { workflow: true },
       },
       {
-        path: 'history',
-        name: 'history',
-        component: HistoryCenterPage,
-      },
-      {
-        path: 'usage',
-        name: 'usage',
-        component: UsagePage,
-      },
-      {
         path: 'account',
         name: 'account',
         component: AccountPage,
-      },
-      {
-        path: 'downloads',
-        name: 'downloads',
-        component: DownloadsPage,
       },
       {
         path: 'chat',
@@ -115,6 +98,11 @@ const routes: RouteRecordRaw[] = [
         path: 'kbs',
         name: 'personal-kbs',
         component: PersonalKbPage,
+      },
+      {
+        path: 'kbs/:kbId/docs/:docId',
+        name: 'kb-doc-detail',
+        component: KbDocDetailPage,
       },
     ],
   },

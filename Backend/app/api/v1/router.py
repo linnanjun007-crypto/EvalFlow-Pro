@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import admin, agent, auth, chat, conversations, downloads, exports, files, health, history, kbs, projects, steps, audit, usage
+from app.api.v1.routes import admin, agent, auth, chat, conversations, downloads, exports, files, health, history, kbs, projects, reports, steps, audit, usage
 
 api_router = APIRouter()
 api_router.include_router(health.router, tags=["system"])
@@ -18,3 +18,4 @@ api_router.include_router(exports.router, prefix="/exports", tags=["exports"])
 api_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 api_router.include_router(usage.router, prefix="/usage", tags=["usage"])
 api_router.include_router(kbs.router, prefix="/kbs", tags=["kbs"])
+api_router.include_router(reports.router, prefix="/reports", tags=["reports"])

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -24,6 +25,18 @@ class KbCreateRequest(BaseModel):
 class KbUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
+    chunk_size: int | None = Field(default=None, ge=100, le=4000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=500)
+    enable_bm25: bool | None = None
+    enable_rerank: bool | None = None
+    rrf_k: int | None = Field(default=None, ge=1, le=200)
+    pdf_enhanced_parse: bool | None = None
+    processing_mode: Literal["chunk", "qa"] | None = None
+    chunk_strategy: Literal["auto", "paragraph", "heading", "fixed"] | None = None
+    index_title: bool | None = None
+    index_image: bool | None = None
+    auto_supplement_index: bool | None = None
+    param_preset: Literal["default", "custom"] | None = None
 
 
 class PromoteRequest(BaseModel):
@@ -33,6 +46,17 @@ class PromoteRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
+
+
+class MigrateDocRequest(BaseModel):
+    target_kb_id: str
+    mode: Literal["move", "copy"] = "move"
+
+
+class ChunkPreviewRequest(BaseModel):
+    chunk_size: int = Field(default=500, ge=100, le=4000)
+    chunk_overlap: int = Field(default=80, ge=0, le=500)
+    chunk_strategy: Literal["auto", "paragraph", "heading", "fixed"] = "auto"
 
 
 def get_kb_service(db: Session = Depends(get_db)) -> KbService:
@@ -82,7 +106,7 @@ def update_kb(
     service: KbService = Depends(get_kb_service),
 ) -> dict[str, Any]:
     try:
-        return service.update_kb(kb_id, user_id, name=payload.name, description=payload.description)
+        return service.update_kb(kb_id, user_id, **payload.model_dump(exclude_none=True))
     except ValueError as exc:
         raise not_found(str(exc)) from exc
 
@@ -370,3 +394,152 @@ def _run_reindex_document(doc_id: str) -> None:
         asyncio.run(reindex_document(db, doc_id))
     finally:
         db.close()
+
+
+# ─── 文件迁移 ───
+
+
+@router.post("/{kb_id}/documents/{doc_id}/migrate")
+def migrate_kb_document(
+    kb_id: str,
+    doc_id: str,
+    background_tasks: BackgroundTasks,
+    payload: MigrateDocRequest = Body(...),
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    from app.services.kb_migration_service import migrate_document
+
+    try:
+        result = migrate_document(
+            db,
+            source_kb_id=kb_id,
+            doc_id=doc_id,
+            target_kb_id=payload.target_kb_id,
+            user_id=user_id,
+            mode=payload.mode,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+    if result.get("reindex_required"):
+        background_tasks.add_task(_run_process_document, result["id"])
+    return result
+
+
+# ─── 文档全文 + 分段 ───
+
+
+@router.get("/{kb_id}/documents/{doc_id}/content")
+def get_kb_document_content(
+    kb_id: str,
+    doc_id: str,
+    user_id: str = Depends(get_current_user_id),
+    service: KbService = Depends(get_kb_service),
+) -> dict[str, Any]:
+    try:
+        return service.get_document_content(doc_id, user_id)
+    except ValueError as exc:
+        raise not_found(str(exc)) from exc
+
+
+# ─── 索引片段导出 ───
+
+
+@router.get("/{kb_id}/documents/{doc_id}/chunks/export")
+def export_kb_document_chunks(
+    kb_id: str,
+    doc_id: str,
+    format: Literal["md", "txt"] = Query(default="md"),
+    user_id: str = Depends(get_current_user_id),
+    service: KbService = Depends(get_kb_service),
+) -> StreamingResponse:
+    try:
+        doc_info = service.get_document(doc_id, user_id)
+    except ValueError as exc:
+        raise not_found(str(exc)) from exc
+
+    chunks_data = service.list_chunks(doc_id, user_id, offset=0, limit=100000)
+    items = chunks_data.get("items", [])
+    file_name = doc_info.get("file_name", "document")
+
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if format == "md":
+        lines = [f"# {file_name}", "", f"> 共 {len(items)} 个片段，导出时间 {now_str}", ""]
+        for item in items:
+            idx = item.get("chunk_index", 0)
+            content = item.get("content", "")
+            lines.append(f"## 片段 #{idx}")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        body = "\n".join(lines)
+        ext = "md"
+    else:
+        lines = [f"=== {file_name} ===", f"共 {len(items)} 个片段，导出时间 {now_str}", ""]
+        for item in items:
+            idx = item.get("chunk_index", 0)
+            content = item.get("content", "")
+            lines.append(f"=== 片段 #{idx} ===")
+            lines.append(content)
+            lines.append("")
+        body = "\n".join(lines)
+        ext = "txt"
+
+    safe_name = file_name.replace("/", "_").replace("\\", "_")
+    filename = f"{safe_name}.chunks.{ext}"
+
+    def _iter():
+        yield body.encode("utf-8")
+
+    from urllib.parse import quote
+    return StreamingResponse(
+        _iter(),
+        media_type="text/markdown" if format == "md" else "text/plain",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+# ─── 分段预览 ───
+
+
+@router.post("/{kb_id}/documents/{doc_id}/preview-chunks")
+def preview_kb_chunks(
+    kb_id: str,
+    doc_id: str,
+    payload: ChunkPreviewRequest = Body(...),
+    user_id: str = Depends(get_current_user_id),
+    service: KbService = Depends(get_kb_service),
+) -> dict[str, Any]:
+    try:
+        return service.preview_chunks(
+            doc_id, user_id,
+            chunk_size=payload.chunk_size,
+            chunk_overlap=payload.chunk_overlap,
+        )
+    except ValueError as exc:
+        raise not_found(str(exc)) from exc
+
+
+# ─── 全库重建索引 ───
+
+
+@router.post("/{kb_id}/reindex-all")
+def reindex_all_kb_docs(
+    kb_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    service: KbService = Depends(get_kb_service),
+) -> dict[str, Any]:
+    try:
+        docs = service.list_documents(kb_id, user_id)
+    except ValueError as exc:
+        raise not_found(str(exc)) from exc
+
+    for doc in docs:
+        background_tasks.add_task(_run_reindex_document, doc["id"])
+    return {"message": "reindex queued", "count": len(docs)}

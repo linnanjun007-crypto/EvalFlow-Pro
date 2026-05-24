@@ -21,5 +21,14 @@ class UserKnowledgeBase(Base):
     enable_bm25: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     enable_rerank: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     rrf_k: Mapped[int] = mapped_column(Integer, default=60, server_default="60", nullable=False)
+
+    pdf_enhanced_parse: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    processing_mode: Mapped[str] = mapped_column(String(32), default="chunk", server_default="chunk", nullable=False)
+    chunk_strategy: Mapped[str] = mapped_column(String(32), default="auto", server_default="auto", nullable=False)
+    index_title: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    index_image: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    auto_supplement_index: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    param_preset: Mapped[str] = mapped_column(String(32), default="default", server_default="default", nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

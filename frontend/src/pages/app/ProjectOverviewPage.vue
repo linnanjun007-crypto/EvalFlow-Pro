@@ -55,8 +55,7 @@ onMounted(refresh)
     <PageHeader :title="`项目总览 · ${projectId}`" description="项目基本信息、流程进度、近期产物与任务入口。">
       <template #actions>
         <el-button type="primary" @click="goWorkflow(1)">进入工作台</el-button>
-        <el-button @click="router.push('/app/history')">查看历史</el-button>
-        <el-button @click="router.push('/app/downloads')">导出</el-button>
+        <el-button @click="router.push('/app/account')">我的报告</el-button>
       </template>
     </PageHeader>
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   createKb,
@@ -7,20 +8,21 @@ import {
   deleteKbDocument,
   getKb,
   listKbDocuments,
-  listKbDocumentChunks,
   listKbs,
+  migrateKbDocument,
   promoteProjectFileToKb,
   reindexKbDocument,
   searchKb,
   updateKb,
   uploadKbDocument,
-  type KbChunk,
   type KbDocument,
   type KbSearchResult,
   type UserKb,
 } from '../../services/kbs'
 import { listProjects, type ProjectResponse } from '../../services/projects'
 import { listFiles, type FileRecord } from '../../services/files'
+
+const router = useRouter()
 
 const kbs = ref<UserKb[]>([])
 const selectedKbId = ref<string | null>(null)
@@ -52,15 +54,11 @@ const importing = ref(false)
 const loadingProjects = ref(false)
 const loadingProjectFiles = ref(false)
 
-// 文档详情抽屉
-const detailDrawer = ref(false)
-const detailDoc = ref<KbDocument | null>(null)
-const detailChunks = ref<KbChunk[]>([])
-const detailTotal = ref(0)
-const detailPage = ref(1)
-const detailPageSize = 20
-const detailLoading = ref(false)
-const expandedChunkIds = ref<Set<number>>(new Set())
+// 文档迁移弹窗
+const migrateDialog = ref(false)
+const migrateDoc = ref<KbDocument | null>(null)
+const migrateForm = ref({ targetKbId: '', mode: 'move' as 'move' | 'copy' })
+const migrating = ref(false)
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -323,53 +321,44 @@ function formatTime(value?: string | null) {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 
-async function openDocDetail(doc: KbDocument) {
+function openDocDetail(doc: KbDocument) {
   if (!selectedKbId.value) return
-  detailDoc.value = doc
-  detailDrawer.value = true
-  detailPage.value = 1
-  expandedChunkIds.value = new Set()
-  await loadDetailChunks()
+  router.push({
+    name: 'kb-doc-detail',
+    params: { kbId: selectedKbId.value, docId: doc.id },
+  })
 }
 
-async function loadDetailChunks() {
-  if (!selectedKbId.value || !detailDoc.value) return
-  detailLoading.value = true
+function openMigrate(doc: KbDocument) {
+  migrateDoc.value = doc
+  migrateForm.value = { targetKbId: '', mode: 'move' }
+  migrateDialog.value = true
+}
+
+async function submitMigrate() {
+  if (!selectedKbId.value || !migrateDoc.value) return
+  if (!migrateForm.value.targetKbId) {
+    ElMessage.warning('请选择目标知识库')
+    return
+  }
+  migrating.value = true
   try {
-    const offset = (detailPage.value - 1) * detailPageSize
-    const res = await listKbDocumentChunks(
-      selectedKbId.value,
-      detailDoc.value.id,
-      offset,
-      detailPageSize,
-    )
-    detailChunks.value = res.items
-    detailTotal.value = res.total
+    await migrateKbDocument(selectedKbId.value, migrateDoc.value.id, {
+      target_kb_id: migrateForm.value.targetKbId,
+      mode: migrateForm.value.mode,
+    })
+    ElMessage.success(migrateForm.value.mode === 'move' ? '已迁移' : '已复制')
+    migrateDialog.value = false
+    await loadDocs(selectedKbId.value)
+    await loadKbDetail(selectedKbId.value)
   } catch (e: any) {
-    ElMessage.error(e.message || '加载片段失败')
+    ElMessage.error(e.message || '迁移失败')
   } finally {
-    detailLoading.value = false
+    migrating.value = false
   }
 }
 
-function onDetailPageChange(page: number) {
-  detailPage.value = page
-  loadDetailChunks()
-}
-
-function toggleChunkExpand(id: number) {
-  const set = new Set(expandedChunkIds.value)
-  if (set.has(id)) set.delete(id)
-  else set.add(id)
-  expandedChunkIds.value = set
-}
-
-function copyToClipboard(text: string) {
-  navigator.clipboard
-    ?.writeText(text)
-    .then(() => ElMessage.success('已复制'))
-    .catch(() => ElMessage.error('复制失败'))
-}
+const migrateTargetOptions = computed(() => kbs.value.filter((kb) => kb.id !== selectedKbId.value))
 
 watch(hasPending, (v) => {
   if (v && !pollTimer) {
@@ -393,7 +382,7 @@ onUnmounted(() => {
   <div class="kb-page">
     <div class="kb-sidebar">
       <div class="sidebar-header">
-        <h3>我的知识库</h3>
+        <h3>知识库</h3>
         <el-button type="primary" size="small" @click="openCreate">新建</el-button>
       </div>
       <div v-loading="loading" class="kb-list">
@@ -460,9 +449,10 @@ onUnmounted(() => {
           <el-table-column label="索引时间" width="160">
             <template #default="{ row }">{{ formatTime(row.indexed_at) }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="180" fixed="right">
+          <el-table-column label="操作" width="240" fixed="right">
             <template #default="{ row }">
               <el-button link size="small" type="primary" @click="openDocDetail(row)">详情</el-button>
+              <el-button link size="small" @click="openMigrate(row)">迁移</el-button>
               <el-button link size="small" @click="onReindex(row)">重建</el-button>
               <el-button link size="small" type="danger" @click="onDeleteDoc(row)">删除</el-button>
             </template>
@@ -550,68 +540,41 @@ onUnmounted(() => {
       </template>
     </el-dialog>
 
-    <!-- 文档详情抽屉 -->
-    <el-drawer v-model="detailDrawer" title="文档详情" size="55%" direction="rtl">
-      <template v-if="detailDoc">
-        <div class="detail-info">
-          <el-descriptions :column="2" border size="small">
-            <el-descriptions-item label="文件名">{{ detailDoc.file_name }}</el-descriptions-item>
-            <el-descriptions-item label="类型">{{ detailDoc.file_type }}</el-descriptions-item>
-            <el-descriptions-item label="大小">{{ formatSize(detailDoc.file_size) }}</el-descriptions-item>
-            <el-descriptions-item label="来源">{{ detailDoc.source_type === 'upload' ? '直接上传' : '项目导入' }}</el-descriptions-item>
-            <el-descriptions-item label="状态">
-              <el-tag :type="statusType(detailDoc.status)" size="small">{{ statusLabel(detailDoc.status) }}</el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item label="片段数">{{ detailDoc.chunk_count }}</el-descriptions-item>
-            <el-descriptions-item label="创建时间">{{ formatTime(detailDoc.created_at) }}</el-descriptions-item>
-            <el-descriptions-item label="索引时间">{{ formatTime(detailDoc.indexed_at) }}</el-descriptions-item>
-          </el-descriptions>
-          <el-alert
-            v-if="detailDoc.status === 'failed' && detailDoc.error_message"
-            type="error"
-            :title="'索引失败'"
-            :description="detailDoc.error_message"
-            show-icon
-            :closable="false"
-            style="margin-top: 12px"
-          />
-        </div>
-
-        <el-divider />
-
-        <div class="detail-chunks-header">
-          <h4>索引片段（共 {{ detailTotal }} 段）</h4>
-        </div>
-
-        <div v-loading="detailLoading" class="detail-chunks-list">
-          <div v-for="chunk in detailChunks" :key="chunk.id" class="chunk-card">
-            <div class="chunk-header">
-              <span class="chunk-idx">#{{ chunk.chunk_index }}</span>
-              <span class="chunk-chars">{{ chunk.char_count }} 字</span>
-              <el-button link size="small" @click="toggleChunkExpand(chunk.id)">
-                {{ expandedChunkIds.has(chunk.id) ? '收起' : '展开' }}
-              </el-button>
-              <el-button link size="small" @click="copyToClipboard(chunk.content)">复制</el-button>
-            </div>
-            <div class="chunk-content" :class="{ expanded: expandedChunkIds.has(chunk.id) }">
-              {{ chunk.content }}
-            </div>
-          </div>
-          <el-empty v-if="!detailLoading && !detailChunks.length" description="暂无索引片段" :image-size="60" />
-        </div>
-
-        <div v-if="detailTotal > detailPageSize" class="detail-pagination">
-          <el-pagination
-            :current-page="detailPage"
-            :page-size="detailPageSize"
-            :total="detailTotal"
-            layout="prev, pager, next"
-            small
-            @current-change="onDetailPageChange"
-          />
-        </div>
+    <!-- 文档迁移弹窗 -->
+    <el-dialog v-model="migrateDialog" title="迁移文档" width="480px">
+      <p style="margin-bottom: 12px; color: #666">
+        将「{{ migrateDoc?.file_name }}」迁移到其他知识库
+      </p>
+      <el-form label-width="100px">
+        <el-form-item label="目标知识库">
+          <el-select v-model="migrateForm.targetKbId" placeholder="选择目标知识库" style="width: 100%">
+            <el-option
+              v-for="kb in migrateTargetOptions"
+              :key="kb.id"
+              :label="kb.name"
+              :value="kb.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="迁移模式">
+          <el-radio-group v-model="migrateForm.mode">
+            <el-radio value="move">移动（原库不保留）</el-radio>
+            <el-radio value="copy">复制（原库保留）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-alert
+          v-if="migrateForm.mode === 'move'"
+          type="info"
+          :closable="false"
+          description="如果目标知识库使用不同的 Embedding 模型，文件将在目标库重新索引。"
+          style="margin-top: 4px"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="migrateDialog = false">取消</el-button>
+        <el-button type="primary" :loading="migrating" @click="submitMigrate">确认迁移</el-button>
       </template>
-    </el-drawer>
+    </el-dialog>
   </div>
 </template>
 

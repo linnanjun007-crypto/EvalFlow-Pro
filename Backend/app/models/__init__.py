@@ -8,6 +8,7 @@ from app.models.llm_call import LlmCall
 from app.models.model_registry import ModelRegistry
 from app.models.project import Project
 from app.models.project_kb import ProjectKnowledgeBase
+from app.models.project_report import ProjectReport
 from app.models.prompt_version import PromptVersion
 from app.models.step_history import StepHistory
 from app.models.step_output import StepOutput
@@ -26,6 +27,7 @@ __all__ = [
     "ModelRegistry",
     "Project",
     "ProjectKnowledgeBase",
+    "ProjectReport",
     "PromptVersion",
     "StepHistory",
     "StepOutput",

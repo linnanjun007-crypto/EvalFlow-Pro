@@ -191,6 +191,10 @@ class StepService:
             )
         )
         self.db.commit()
+
+        if step_code == "step14":
+            self._maybe_generate_project_report(project_id)
+
         return {
             "id": step_output.id,
             "project_id": project_id,
@@ -201,6 +205,22 @@ class StepService:
             "version": version,
             "is_final": True,
         }
+
+    def _maybe_generate_project_report(self, project_id: str) -> None:
+        """Step14 完成时尝试生成项目完整报告，失败不阻塞主流程。"""
+        import logging
+
+        from app.models.project import Project
+        from app.services.project_report_service import generate_report
+
+        logger = logging.getLogger(__name__)
+        try:
+            project = self.db.get(Project, project_id)
+            if not project:
+                return
+            generate_report(self.db, project_id=project_id, user_id=project.user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto generate project report failed: %s", exc)
 
     def list_step_histories(self, project_id: str, step_code: str) -> list[dict[str, Any]]:
         outputs = self.db.scalars(
