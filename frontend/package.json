@@ -10,11 +10,13 @@
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
+    "@types/sortablejs": "^1.15.9",
     "axios": "^1.16.0",
     "dompurify": "^3.4.5",
     "element-plus": "^2.14.0",
     "markdown-it": "^14.1.1",
     "pinia": "^3.0.4",
+    "sortablejs": "^1.15.7",
     "vue": "^3.5.32",
     "vue-router": "^5.0.6"
   },

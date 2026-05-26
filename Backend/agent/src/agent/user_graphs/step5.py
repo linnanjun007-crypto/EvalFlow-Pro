@@ -58,6 +58,7 @@ class ScoreStandard(TypedDict, total=False):
     l2_name: str
     l3_name: str
     score: float
+    key_points: str
     rubric: RubricTiers
     approved: bool
     model_name: str
@@ -125,6 +126,7 @@ def _flatten_scored_tree(tree: list[L1ScoreRow]) -> list[ScoreStandard]:
                         "l2_name": str(l2.get("name", "")),
                         "l3_name": str(l3.get("name", "")),
                         "score": float(l3.get("score", 0)),
+                        "key_points": str(l3.get("key_points") or "").strip(),
                         "rubric": {tier: "" for tier in RUBRIC_TIERS},
                         "approved": False,
                         "model_name": "",
@@ -141,29 +143,46 @@ def _style_tone(style: ScoreStyle) -> str:
     return "语气中立、客观、专业，描述事实性证据与判定口径。"
 
 
+def _split_key_points(key_points: str) -> tuple[str, str]:
+    """从 ``取证：…；扣分：…`` 文本中分别抽取取证与扣分两段。"""
+    text = (key_points or "").strip()
+    if not text:
+        return "", ""
+    evidence, penalty = "", ""
+    if "取证：" in text:
+        after = text.split("取证：", 1)[1]
+        evidence = after.split("扣分：", 1)[0].strip().rstrip("；;。.")
+    if "扣分：" in text:
+        penalty = text.split("扣分：", 1)[1].strip().rstrip("；;。.")
+    return evidence, penalty
+
+
 def _fallback_rubric_for_row(row: ScoreStandard, style: ScoreStyle) -> RubricTiers:
     name = row.get("l3_name") or "本指标"
     score = float(row.get("score", 0) or 0)
+    evidence, penalty = _split_key_points(row.get("key_points") or "")
+    evidence_hint = f"提供 {evidence}；" if evidence else ""
+    penalty_hint = f"若出现：{penalty}。" if penalty else ""
     tone_hint = "（备注：当前为规则模板回退，建议重试模型调用）"
     if style == "尖锐":
         return {
-            "优秀": f"{name} 完成度突出，证据齐全且远超基本要求，可给满分 {score:.2f} 分。{tone_hint}",
-            "良好": f"{name} 完成度较好，存在个别瑕疵但不影响整体成效，可给 {score * 0.85:.2f} 分。{tone_hint}",
-            "合格": f"{name} 基本达到要求，但存在明显改进空间，可给 {score * 0.6:.2f} 分。{tone_hint}",
-            "不合格": f"{name} 未达到基本要求或证据严重不足，扣减至 {max(0.0, score * 0.3):.2f} 分及以下。{tone_hint}",
+            "优秀": f"{evidence_hint}{name} 全部材料齐全且质量过硬，无任何扣分情形，给 {score * 0.95:.0f}~{score:.0f} 分。{tone_hint}",
+            "良好": f"{evidence_hint}{name} 主要材料齐全，仅个别细节瑕疵，触发扣分细则中 ≤10% 的轻度扣项，给 {score * 0.75:.0f}~{score * 0.89:.0f} 分。{tone_hint}",
+            "合格": f"{name} 部分关键材料缺失或触发扣分细则中 10%~30% 的扣项；{penalty_hint}给 {score * 0.6:.0f}~{score * 0.74:.0f} 分。{tone_hint}",
+            "不合格": f"{name} 核心材料缺失或触发扣分细则中 ≥40% 的重度扣项；{penalty_hint}给 0~{score * 0.59:.0f} 分。{tone_hint}",
         }
     if style == "委婉":
         return {
-            "优秀": f"{name} 整体表现优秀，建议给予满分 {score:.2f} 分。{tone_hint}",
-            "良好": f"{name} 整体表现良好，建议给予 {score * 0.85:.2f} 分。{tone_hint}",
-            "合格": f"{name} 基本达标，建议给予 {score * 0.6:.2f} 分，并提示进一步完善方向。{tone_hint}",
-            "不合格": f"{name} 暂未达到要求，建议给予 {max(0.0, score * 0.3):.2f} 分，并制订改进计划。{tone_hint}",
+            "优秀": f"{evidence_hint}{name} 材料齐全、质量上乘，建议给 {score * 0.95:.0f}~{score:.0f} 分。{tone_hint}",
+            "良好": f"{evidence_hint}{name} 大部分材料完整，少量细节可进一步完善，建议给 {score * 0.75:.0f}~{score * 0.89:.0f} 分。{tone_hint}",
+            "合格": f"{name} 基本满足要求，但部分取证材料需要补充；{penalty_hint}建议给 {score * 0.6:.0f}~{score * 0.74:.0f} 分。{tone_hint}",
+            "不合格": f"{name} 关键取证缺失或扣分细则触发严重；{penalty_hint}建议给 0~{score * 0.59:.0f} 分并补充改进计划。{tone_hint}",
         }
     return {
-        "优秀": f"{name} 完成质量高、证据充分，可给满分 {score:.2f} 分。{tone_hint}",
-        "良好": f"{name} 完成情况较好，可给 {score * 0.85:.2f} 分。{tone_hint}",
-        "合格": f"{name} 基本符合要求，可给 {score * 0.6:.2f} 分。{tone_hint}",
-        "不合格": f"{name} 未达到基本要求，可给 {max(0.0, score * 0.3):.2f} 分以下。{tone_hint}",
+        "优秀": f"{evidence_hint}{name} 材料齐全、证据充分，无任何扣分情形，给 {score * 0.95:.0f}~{score:.0f} 分。{tone_hint}",
+        "良好": f"{evidence_hint}{name} 主要材料齐备，仅个别瑕疵触发轻度扣项（≤10%），给 {score * 0.75:.0f}~{score * 0.89:.0f} 分。{tone_hint}",
+        "合格": f"{name} 部分材料缺失或触发 10%~30% 扣项；{penalty_hint}给 {score * 0.6:.0f}~{score * 0.74:.0f} 分。{tone_hint}",
+        "不合格": f"{name} 核心材料缺失或触发 ≥40% 重度扣项；{penalty_hint}给 0~{score * 0.59:.0f} 分。{tone_hint}",
     }
 
 
@@ -199,10 +218,17 @@ def _build_rubric_prompt(
     user_kb_context: str = "",
 ) -> str:
     preamble = build_admin_preamble(admin_prompt, admin_kb, user_kb_context)
-    indicator_blob = "\n".join(
-        f"- id={row['id']} | 一级={row['l1_name']} / 二级={row['l2_name']} / 三级={row['l3_name']} | 满分={row['score']:.2f}"
-        for row in rows
-    )
+    indicator_lines: list[str] = []
+    for row in rows:
+        kp = (row.get("key_points") or "").strip().replace("\n", " ")
+        header = (
+            f"- id={row['id']} | 一级={row['l1_name']} / 二级={row['l2_name']} "
+            f"/ 三级={row['l3_name']} | 满分={row['score']:.2f}"
+        )
+        indicator_lines.append(header)
+        if kp:
+            indicator_lines.append(f"    取证与扣分细则：{kp}")
+    indicator_blob = "\n".join(indicator_lines)
     feedback_block = (
         f"\n【人工反馈意见（请按此调整本次输出）】\n{review_feedback.strip()}\n"
         if review_feedback.strip()
@@ -211,11 +237,16 @@ def _build_rubric_prompt(
     style_text = _style_tone(style)
     instructions = [
         "请为下列三级指标分别生成评分标准，必须覆盖四档：优秀 / 良好 / 合格 / 不合格。",
-        "要求：",
-        "1. 每档输出 1～3 句中文文字，写明判定条件、证据要求与扣分要点；",
-        "2. 不允许出现 '同上' '略' 等占位说明；",
-        "3. 各档之间界限清晰，不要语义重叠；",
-        f"4. 风格控制：{style_text}",
+        "强制要求：",
+        "1. **必须严格依据每条指标下方给出的『取证与扣分细则』来撰写四档评分标准**，不得脱离这些证据材料和扣分点凭空发挥；",
+        "2. 优秀档：列明需提供哪些取证材料齐全且质量高（直接引用该指标的取证清单），以及对应的最高得分区间（约 90%~100% 满分）；",
+        "3. 良好档：允许个别取证材料瑕疵或部分扣分点轻微触发，给出对应得分区间（约 75%~89% 满分），并说明保留分数的判定边界；",
+        "4. 合格档：将该指标『扣分细则』中的轻度扣分情形（约 30% 以下扣分）对应到 60%~74% 满分区间，写明仍可保留基本分的最低条件；",
+        "5. 不合格档：将『扣分细则』中重度扣分情形（≥40% 扣分）或核心取证材料缺失情形对应到 0%~59% 满分区间，写明触发条件；",
+        "6. 每档输出 1～3 句中文文字，必须出现该指标取证清单中的具体材料名或扣分细则中的具体百分比/触发条件，不允许出现 '同上' '略' '相关材料齐全' 等占位说明；",
+        "7. 各档之间界限清晰、可量化，不得出现语义重叠；",
+        "8. 文字内容直接以判定语句开头（如「提供…材料完整且…」），不要再重复写满分多少分；",
+        f"9. 风格控制：{style_text}",
         "",
         "输出格式（严格 JSON，不要任何额外文字）：",
         "{",
@@ -231,7 +262,7 @@ def _build_rubric_prompt(
             "项目核心内容：",
             (project_core_content or "（未提供，请仅围绕指标含义生成评分标准）").strip(),
             "",
-            "待生成评分标准的三级指标列表：",
+            "待生成评分标准的三级指标列表（含取证与扣分细则，必须严格作为评分依据）：",
             indicator_blob or "（空）",
             feedback_block,
             "",
@@ -320,8 +351,11 @@ def _render_markdown(project_name: str, rows: list[ScoreStandard]) -> str:
         rubric = row.get("rubric") or {}
         status = "已确认" if row.get("approved") else "待确认"
         lines.append(
-            f"  - 三级：{row.get('l3_name')} ｜ 满分：{row.get('score', 0):.2f} ｜ 状态：{status}"
+            f"  - 三级：{row.get('l3_name')} ｜ 满分：{row.get('score', 0):.0f} 分 ｜ 状态：{status}"
         )
+        kp = (row.get("key_points") or "").strip()
+        if kp:
+            lines.append(f"    - 取证与扣分依据：{kp}")
         for tier in RUBRIC_TIERS:
             text = (rubric.get(tier) or "").strip() or "（待补充）"
             lines.append(f"    - **{tier}**：{text}")
@@ -345,10 +379,20 @@ def validate_step4_basis(state: Step5State) -> Step5State:
             "updated_at": now_iso(),
         }
     name = (state.get("project_name") or "未命名项目").strip() or "未命名项目"
-    rows = state.get("score_standards") or _flatten_scored_tree(tree)
+    # 关键：每次进入第五步都基于最新的 scored_tree 重建 score_standards，
+    # 否则 MemorySaver 里的旧 score_standards（含旧 l3_name / 旧分值 / 缺 key_points）
+    # 会被原样带回，让"重新生成"形同虚设。
+    rows = _flatten_scored_tree(tree)
     return {
         "project_name": name,
         "score_standards": rows,
+        "draft_rubrics_markdown": "",
+        "final_rubrics_markdown": "",
+        "content_text": "",
+        "model_comparisons": [],
+        "review_round": 0,
+        "review_feedback": "",
+        "manual_rubric_overrides": {},
         "created_at": state.get("created_at") or now_iso(),
         "updated_at": now_iso(),
         "status": "basis_ok",

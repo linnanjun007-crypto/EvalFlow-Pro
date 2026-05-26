@@ -14,6 +14,7 @@ from app.integrations.agent_runner import AgentRunner
 from app.models.file import File
 from app.services.admin_service import AdminService
 from app.services.memory_service import MemoryService
+from app.models.memory import ProjectMemorySession
 from sqlalchemy import select
 
 router = APIRouter()
@@ -373,3 +374,38 @@ async def update_thread_state(
         raise HTTPException(status_code=500, detail=f'update_state failed: {exc}') from exc
 
     return {'thread_id': thread_id, 'updated': True, 'keys': list(values.keys())}
+
+
+@router.post('/state/clear')
+async def clear_thread_state(
+    payload: dict[str, Any] = Body(...),
+    user_id: str = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    """确认提交后清除指定 thread 的 MemorySaver 短期记忆，并归档 memory session。"""
+    step_code = str(payload.get('step_code') or '').lower().strip()
+    role = str(payload.get('role') or 'client').lower().strip()
+    thread_id = str(payload.get('thread_id') or '')
+    project_id = str(payload.get('project_id') or '')
+    if not thread_id:
+        raise HTTPException(status_code=400, detail='thread_id is required')
+    if not step_code:
+        raise HTTPException(status_code=400, detail='step_code is required')
+
+    cleared = runner.clear_thread(role=role, step_code=step_code, thread_id=thread_id)
+
+    if project_id:
+        with SessionLocal() as db:
+            memory = MemoryService(db)
+            existing = db.scalar(
+                select(ProjectMemorySession).where(
+                    ProjectMemorySession.project_id == project_id,
+                    ProjectMemorySession.step_code == step_code,
+                    ProjectMemorySession.memory_scope == 'short_term',
+                    ProjectMemorySession.status == 'active',
+                )
+            )
+            if existing:
+                existing.status = 'archived'
+                db.commit()
+
+    return {'thread_id': thread_id, 'cleared': cleared, 'step_code': step_code}

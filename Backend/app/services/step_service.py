@@ -40,7 +40,6 @@ class StepService:
 
         result = self.runner.run(role=role, step_code=step_code, payload=payload, context=context)
         content_text = self._extract_text(result)
-        content_json = _dumps_json(result)
 
         memory = MemoryService(self.db)
         session = memory.ensure_session(project_id=project_id, user_id=payload.get('user_id') if isinstance(payload.get('user_id'), str) else None, step_code=step_code, memory_scope='short_term')
@@ -54,36 +53,12 @@ class StepService:
             metadata={'role': role},
         )
 
-        step_output = StepOutput(
-            id=str(uuid4()),
-            project_id=project_id,
-            step_code=step_code,
-            title=f"{step_code} 输出",
-            content_json=content_json,
-            content_text=content_text,
-            version=1,
-            is_final=True,
-        )
-        self.db.add(step_output)
-        self.db.flush()
-
-        step_history = StepHistory(
-            id=str(uuid4()),
-            step_output_id=step_output.id,
-            model_name=self._extract_model_name(result, context),
-            prompt_version_id=None,
-            content_json=content_json,
-            content_text=content_text,
-        )
-        self.db.add(step_history)
-
         task.status = "succeeded"
         task.progress = 100
         self.db.commit()
 
         return {
             "task_id": task.id,
-            "step_output_id": step_output.id,
             "step_code": step_code,
             "status": task.status,
             "result": result,
@@ -192,6 +167,8 @@ class StepService:
         )
         self.db.commit()
 
+        self._clear_short_term_memory(project_id=project_id, step_code=step_code)
+
         if step_code == "step14":
             self._maybe_generate_project_report(project_id)
 
@@ -205,6 +182,35 @@ class StepService:
             "version": version,
             "is_final": True,
         }
+
+    def _clear_short_term_memory(self, project_id: str, step_code: str) -> None:
+        """提交到 step_output 后，清空 LangGraph MemorySaver thread 与 memory_session 短期记录。"""
+        import logging
+
+        from app.models.memory import ProjectMemorySession
+
+        logger = logging.getLogger(__name__)
+        try:
+            self.runner.clear_thread(role="client", step_code=step_code, thread_id=f"{step_code}:{project_id}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("clear MemorySaver thread failed: %s", exc)
+
+        try:
+            sessions = self.db.scalars(
+                select(ProjectMemorySession).where(
+                    ProjectMemorySession.project_id == project_id,
+                    ProjectMemorySession.step_code == step_code,
+                    ProjectMemorySession.memory_scope == "short_term",
+                    ProjectMemorySession.status == "active",
+                )
+            ).all()
+            for session in sessions:
+                session.status = "archived"
+            if sessions:
+                self.db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("archive short-term memory session failed: %s", exc)
+            self.db.rollback()
 
     def _maybe_generate_project_report(self, project_id: str) -> None:
         """Step14 完成时尝试生成项目完整报告，失败不阻塞主流程。"""

@@ -169,6 +169,42 @@ To initialize: `python Backend/init_db.py` or load `Backend/database_schema.sql`
 
 5. **Redis**: Used for caching and task queuing (workers may process async operations).
 
+## Step 存储规则（所有 step 必须遵守）
+
+客户端（`workflow_role = client/user`）所有 `step1` – `step14` 的草稿、生成内容、模型对比结果在用户**未确认提交**前，统一只放在短期记忆里，**不写 PostgreSQL 业务表（`step_output` / `step_history`）**。
+
+### 双层短期记忆
+
+1. **后端 LangGraph MemorySaver（主短期记忆）**
+   - 每个 step graph 都用 `graph.compile(checkpointer=MemorySaver(), ...)` 编译
+   - thread 命名约定：`<step_code>:<project_id>`（如 `step3:abc123`）
+   - 每次 `runAgent` / `updateThreadState` 都把生成结果、用户编辑写到对应 thread state
+   - 同时在 `project_memory_session` / `project_memory_entry` 表里记录 `memory_scope='short_term'` 的会话痕迹
+
+2. **前端 `localStorage`（保险副本）**
+   - key 命名约定：`ef_<step_code>_draft:<project_id>:<thread_id>`，历史版本副 key 用 `ef_<step_code>_draft_history:...`
+   - 保存所有用户可编辑字段（`editor` 文本、`currentResult`、step 特有的结构化字段如 `step3SkeletonTasks`、`step4FlatL2Tasks`、`step9StyleMode`、`step14ExportCustomTitle` 等）
+   - 进入 step 页面优先 `loadStepDraftState`，命中后不去重新拉数据库结果
+   - 用 debounce/`watch` 在编辑器变化时自动写入，作为 MemorySaver 的浏览器侧保险
+
+### 确认提交动作
+
+只有用户点击"确认提交 / 保存最终版本"按钮时才走持久化路径：
+
+1. 调 `POST /api/v1/steps/{step_code}/save`（`step_service.save_step_result`），写入 `step_output` + `step_history`，递增 `version`，`is_final=True`
+2. 提交成功后，**两层短期缓存必须同时清除**：
+   - 前端：`localStorage.removeItem(step{N}DraftKey.value)` + 历史副本 key + 重置内存中的 `step{N}DraftDirty / step{N}DraftHistory` ref
+   - 后端：调 `POST /api/v1/agent/state/clear`（`agent_runner.clear_thread`）丢弃该 `step_code:project_id` thread 的 MemorySaver 检查点；并将 `project_memory_session.status` 置为 `archived`
+
+### 禁止的反例
+
+- ❌ 不要让 `runAgent` / `generateStep` 直接产出 `step_output`/`step_history` 记录（生成只能落短期记忆）
+- ❌ 不要在 `saveStepResult` 之外的路径（自动保存、心跳、切换 step）写 `step_output`
+- ❌ 不要在 `saveStepResult` 成功后跳过任一层短期缓存的清理 —— 残留会导致用户下次进入 step 看到旧草稿覆盖最终版本
+- ❌ 不要为新 step 跳过 `localStorage` 双保险层；浏览器刷新或后端重启 MemorySaver 丢失时，没有它就没有兜底
+
+新增/重构 step 时务必同时实现 `saveStep{N}DraftState` / `loadStep{N}DraftState` / `clearStep{N}DraftState` 三件套，并在确认提交回调里同时调用 `clearStep{N}DraftState()` 与 `clearAgentThreadState('step{N}', threadId)`。
+
 ## Running the Full Stack Locally
 
 1. Start PostgreSQL and ensure `agent_king` database exists

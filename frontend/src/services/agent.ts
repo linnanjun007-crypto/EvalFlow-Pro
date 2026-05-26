@@ -48,3 +48,8 @@ export async function updateThreadState(params: { step_code: string; thread_id: 
   const { data } = await api.post<{ thread_id: string; updated: boolean; keys: string[] }>('/agent/state/update', params)
   return data
 }
+
+export async function clearThreadState(params: { step_code: string; thread_id: string; project_id?: string; role?: string }) {
+  const { data } = await api.post<{ thread_id: string; cleared: boolean; step_code: string }>('/agent/state/clear', params)
+  return data
+}

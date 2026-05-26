@@ -66,3 +66,28 @@ class AgentRunner:
             "status": "not_implemented",
             "message": "当前步骤尚未提供专用图，已降级到统一路由层但仍缺少可执行图。",
         }
+
+    def clear_thread(self, role: str, step_code: str, thread_id: str) -> bool:
+        """丢弃指定 thread 的 MemorySaver 检查点（短期记忆），用于确认提交后清理。"""
+        role = role.lower().strip()
+        step_code = step_code.lower().strip()
+        graph = _load_graph(role, step_code)
+        if graph is None or not thread_id:
+            return False
+        checkpointer = getattr(graph, "checkpointer", None)
+        if checkpointer is None:
+            return False
+        try:
+            if hasattr(checkpointer, "delete_thread"):
+                checkpointer.delete_thread(thread_id)
+                return True
+            storage = getattr(checkpointer, "storage", None)
+            if isinstance(storage, dict) and thread_id in storage:
+                storage.pop(thread_id, None)
+                writes = getattr(checkpointer, "writes", None)
+                if isinstance(writes, dict):
+                    writes.pop(thread_id, None)
+                return True
+        except Exception:
+            return False
+        return False

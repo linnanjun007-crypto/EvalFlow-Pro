@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
+import Sortable from 'sortablejs'
 import type { UploadFile, UploadProps } from 'element-plus'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
+import { createMarkdown, renderSafe } from '../../utils/markdownConfig'
 import PageHeader from '../../components/ef/PageHeader.vue'
 import StepSidebar from '../../components/ef/StepSidebar.vue'
 import GenerationPanel from '../../components/ef/GenerationPanel.vue'
@@ -13,7 +15,7 @@ import TaskProgress from '../../components/ef/TaskProgress.vue'
 import Step1Analysis from '../../components/ef/Step1Analysis.vue'
 import MarkdownDashboard from '../../components/ef/MarkdownDashboard.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { cancelAgentRun, runAgent, updateThreadState, type AgentRunResponse } from '../../services/agent'
+import { cancelAgentRun, clearThreadState, getThreadState, runAgent, updateThreadState, type AgentRunResponse } from '../../services/agent'
 import { useWorkflowBus } from '../../stores/workflowBus'
 
 const props = withDefaults(defineProps<{ embeddedMode?: boolean }>(), { embeddedMode: false })
@@ -172,6 +174,8 @@ const editor = ref('')
 const editorPlaceholder = '最终版本内容将在这里编辑。'
 const step1DraftKey = computed(() => `ef_step1_draft:${projectId.value}:${step1ThreadId.value}`)
 const step1DraftHistoryKey = computed(() => `ef_step1_draft_history:${projectId.value}:${step1ThreadId.value}`)
+const step2DraftKey = computed(() => `ef_step2_draft:${projectId.value}:${step2ThreadId.value}`)
+const step3DraftKey = computed(() => `ef_step3_draft:${projectId.value}`)
 const currentResult = ref<Record<string, unknown> | null>(null)
 const step1StructuredAnalysis = computed(() => {
   const sa = currentResult.value?.structured_analysis as Record<string, unknown> | undefined
@@ -187,7 +191,7 @@ const step1ExpandDialog = ref(false)
 const draftPreviewModes = ref<Record<string, 'raw' | 'preview'>>({})
 const projectFiles = ref<FileRecord[]>([])
 const projectName = ref(localStorage.getItem('ef_project_name') || '')
-const historyItems = ref<Array<{ id: string; title: string; desc: string; content: string }>>([])
+const historyItems = ref<Array<{ id: string; title: string; desc: string; content: string; content_json?: string }>>([])
 const currentOutputs = ref<Array<{ title: string; desc: string; content: string }>>([])
 const compareItems = ref<Array<{ label: string; content: string }>>([])
 const placeholderEditorTexts = [editorPlaceholder, '最后版本内容将在这里编辑。']
@@ -222,6 +226,17 @@ interface Step3L2Task {
 }
 const step3SkeletonTasks = ref<Step3L2Task[]>([])
 const step3ActiveL2Index = ref(0)
+const step3ActiveL2Tab = computed({
+  get: () => String(step3ActiveL2Index.value),
+  set: (value: string) => {
+    const idx = Number(value)
+    if (Number.isFinite(idx)) selectStep3L2(idx)
+  },
+})
+function onStep3TabChange(name: string | number) {
+  const idx = Number(name)
+  if (Number.isFinite(idx)) selectStep3L2(idx)
+}
 const step3L3Draft = ref('')
 const step3L3Comparisons = ref<Array<{ model_name: string; label: string; draft: string; error: string }>>([])
 const step3L3ReviewMode = ref<'approve' | 'modify'>('approve')
@@ -264,6 +279,11 @@ const step3L2Progress = computed(() => {
   return { total, completed, percent: total ? Math.round((completed / total) * 100) : 0 }
 })
 const step3HasSkeleton = computed(() => step3SkeletonTasks.value.length > 0)
+const step3HasStep2Core = computed(() => {
+  const s = step3State.value
+  if (!s) return false
+  return Boolean(s.core_basis_digest || s.project_core_content || s.final_core_content || s.content_text || s.core_content_draft)
+})
 const step3CanGenerateL3 = computed(() => step3HasSkeleton.value && step3ActiveL2Task.value !== null)
 const step3AllL2Completed = computed(() => {
   return step3SkeletonTasks.value.length > 0 && step3SkeletonTasks.value.every((t) => t.l3_section_markdown)
@@ -290,6 +310,8 @@ interface Step4ScoreItem {
   level3_name?: string
   weight?: number
   score?: number
+  target_l3_count?: number
+  l3_section_markdown?: string
 }
 const step4FlatL2Tasks = ref<Step4ScoreItem[]>([])
 const step4ScoringMode = ref<'ai' | 'manual'>('ai')
@@ -297,12 +319,138 @@ const step4ManualScores = ref<Record<string, number>>({})
 const step4ValidationErrors = ref<string[]>([])
 const step4TotalScore = ref(100)
 const step5ScoreSheet = ref('')
+// step6：是否生成里克特满意度问卷 + 问卷反馈意见 + 后端返回的问卷草稿/条目快照
+const step6QuestionnaireDecision = ref<'need' | 'skip'>('skip')
+const step6QuestionnaireFeedback = ref('')
+const step6QuestionnaireDraft = ref('')
+interface Step6QItem {
+  id: string
+  indicator_id?: string
+  indicator_name?: string
+  question: string
+  options: string[]
+  source_note?: string
+  model_name?: string
+}
+const step6QuestionnaireItems = ref<Step6QItem[]>([])
+// step6 试填：本地 mock，不走后端
+const step6RespondentRole = ref<'村民' | '村两委' | '镇政府' | '其他'>('村民')
+const step6Answers = ref<Record<string, string>>({})
+interface Step6ResponseRecord {
+  version: number
+  respondent_role: string
+  answers: Record<string, string>
+  submitted_at: string
+}
+const step6ResponseHistory = ref<Step6ResponseRecord[]>([])
+const step6Exporting = ref(false)
+
+// step6 拖拽：把 currentResult.scored_tree 拷贝成可编辑结构，拖拽后回写
+interface Step6L3Node {
+  id: string
+  name: string
+  score: number
+  key_points?: string
+  rubric?: Record<string, string>
+}
+interface Step6L2Node {
+  name: string
+  score: number
+  level3: Step6L3Node[]
+}
+interface Step6L1Node {
+  name: string
+  score: number
+  level2: Step6L2Node[]
+}
+const step6Tree = ref<Step6L1Node[]>([])
+const step6TreeDirty = ref(false)
+const step6L1ListRef = ref<HTMLElement | null>(null)
+const step6L2ListRefs = ref<Record<string, HTMLElement | null>>({})
+const step6L3ListRefs = ref<Record<string, HTMLElement | null>>({})
+const step6SortableInstances: Sortable[] = []
+function setStep6L2Ref(key: string, el: Element | null) {
+  step6L2ListRefs.value[key] = (el as HTMLElement | null)
+}
+function setStep6L3Ref(key: string, el: Element | null) {
+  step6L3ListRefs.value[key] = (el as HTMLElement | null)
+}
+
+// ===== Step 7: 指标体系分析与终审成果生成 =====
+interface Step7PointSlot { key: string; label: string; hint?: string; suggested_score?: number }
+interface Step7PointInput { key: string; label: string; plain_text: string; score: number; deduction_reason: string }
+interface Step7IndicatorForm {
+  id: string
+  l1_name: string
+  l2_name: string
+  l3_name: string
+  score: number
+  tag?: string
+  points: Step7PointSlot[]
+  rubric?: Record<string, string>
+}
+interface Step7AnalysisRow {
+  id: string
+  l1_name: string
+  l2_name: string
+  l3_name: string
+  score: number
+  obtained_score: number
+  score_rate: number
+  deduction_reason: string
+  analysis: string
+  point_inputs?: Step7PointInput[]
+  model_name?: string
+}
+interface Step7Comparison { model_name: string; label: string; draft: string; error?: string }
+const step7Form = ref<Step7IndicatorForm[]>([])
+const step7Inputs = ref<Record<string, Step7PointInput[]>>({})
+const step7AnalysisRows = ref<Step7AnalysisRow[]>([])
+const step7BlockMd = ref('')
+const step7OverallMd = ref('')
+const step7FinalMd = ref('')
+const step7TotalScore = ref(0)
+const step7TotalFull = ref(0)
+const step7OverallRate = ref(0)
+const step7Comparisons = ref<Step7Comparison[]>([])
+const step7ReviewFeedback = ref('')
+const step7SurveySample = ref<number | null>(null)
+const step7SurveyRate = ref<number | null>(null)
+const step7SurveySummary = ref('')
+const step7Generating = ref(false)
+const step7Reviewing = ref(false)
+const step7Bootstrapping = ref(false)
+const step7ExportFontFamily = ref('SimSun')
+const step7ExportFontSize = ref(12)
+const step7ExportLineHeight = ref(1.5)
+const step7MarkdownRenderer = createMarkdown()
+function renderMarkdown(src: string): string {
+  if (!src) return ''
+  try {
+    return renderSafe(step7MarkdownRenderer, src)
+  } catch {
+    return ''
+  }
+}
+function step7TotalUserSum(form: Step7IndicatorForm): number {
+  const pts = step7Inputs.value[form.id] || []
+  return Math.round(pts.reduce((s, p) => s + (Number(p.score) || 0), 0) * 100) / 100
+}
+function step7ClampPoint(form: Step7IndicatorForm, pt: Step7PointInput) {
+  const max = Number(form.score) || 0
+  if (!Number.isFinite(pt.score) || pt.score < 0) pt.score = 0
+  // 限制单要点不超过该指标满分（更精细的"sum 不超满分"在 UI 用 step7TotalUserSum 显示）
+  if (pt.score > max) pt.score = max
+}
 const step9StyleMode = ref<'neutral' | 'sharp' | 'gentle'>('neutral')
 const step14ExportSaving = ref(false)
 const step14ExportFormat = ref<ExportFormat>('markdown')
 const step14ExportCustomTitle = ref('')
 const prevStepContent = ref('')
 const prevStepViewMode = ref<'raw' | 'preview'>('raw')
+// 缓存上一步的结构化结果（如 step4 的 scored_tree、step3 的 flat_l2_tasks 等），
+// 供 step5+ 构造 agent payload 时回传到后端 graph
+const prevStepResult = ref<Record<string, unknown> | null>(null)
 
 const workflowStatus = ref<WorkflowStatusResponse | null>(null)
 type ClientModelConfig = {
@@ -673,6 +821,45 @@ function setProjectName(name: string) {
   localStorage.setItem('ef_project_name', value)
 }
 
+function genericStepDraftKey(stepCode: string) {
+  return `ef_${stepCode}_draft:${projectId.value}:${stepCode}:${projectId.value}`
+}
+
+function saveGenericStepDraft(stepCode: string, draft: Record<string, unknown>) {
+  if (!projectId.value || !stepCode) return
+  try {
+    localStorage.setItem(genericStepDraftKey(stepCode), JSON.stringify({ ...draft, _saved_at: Date.now() }))
+  } catch { /* quota / serialize errors are non-fatal */ }
+}
+
+function loadGenericStepDraft(stepCode: string): Record<string, unknown> | null {
+  if (!projectId.value || !stepCode) return null
+  const raw = localStorage.getItem(genericStepDraftKey(stepCode))
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function clearGenericStepDraft(stepCode: string) {
+  if (!projectId.value || !stepCode) return
+  localStorage.removeItem(genericStepDraftKey(stepCode))
+}
+
+async function clearStepShortTermMemory(stepCode: string, threadId?: string) {
+  // 兜底清理：同时清掉前端 localStorage 通用草稿 + 后端 MemorySaver thread + memory_session 短期记录
+  clearGenericStepDraft(stepCode)
+  const tid = (threadId && threadId.trim()) || `${stepCode}:${projectId.value}`
+  try {
+    await clearThreadState({ step_code: stepCode, thread_id: tid, project_id: projectId.value, role: 'client' })
+  } catch (e) {
+    console.warn(`[step-memory] clear ${stepCode} thread failed`, e)
+  }
+}
+
 function saveStep1DraftState(draft: Record<string, unknown>) {
   localStorage.setItem(step1DraftKey.value, JSON.stringify(draft))
 }
@@ -778,6 +965,121 @@ function clearStep1DraftState() {
   localStorage.removeItem(step1DraftKey.value)
   localStorage.removeItem(step1DraftHistoryKey.value)
   step1DraftHistory.value = []
+}
+
+function saveStep2DraftState() {
+  const draft = {
+    project_id: projectId.value,
+    thread_id: step2ThreadId.value,
+    editor: editor.value,
+    result_text: resultText.value,
+    current_result: currentResult.value,
+    verification_digest: step2VerificationDigest.value,
+    parse_warnings: step2ParseWarnings.value,
+    model_comparisons: step2ModelComparisons.value,
+    source_index: step2SourceIndex.value,
+    media_metadata: step2MediaMetadata.value,
+    docs_metadata: step2DocsMetadata.value,
+    status_text: step2StatusText.value,
+    default_categories: step2DefaultCategories.value,
+    extra_categories: step2ExtraCategories.value,
+    review_mode: step2ReviewMode.value,
+    review_feedback: step2ReviewFeedback.value,
+    verification_ack: step2VerificationAck.value,
+    active_compare_index: step2ActiveCompareIndex.value,
+    updated_at: new Date().toISOString(),
+  }
+  localStorage.setItem(step2DraftKey.value, JSON.stringify(draft))
+}
+
+function loadStep2DraftState(): Record<string, unknown> | null {
+  const raw = localStorage.getItem(step2DraftKey.value)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function restoreStep2DraftState(draft: Record<string, unknown>) {
+  if (typeof draft.editor === 'string' && draft.editor.trim() && !placeholderEditorTexts.includes(draft.editor.trim())) {
+    editor.value = draft.editor
+  }
+  if (typeof draft.result_text === 'string') resultText.value = draft.result_text
+  if (draft.current_result && typeof draft.current_result === 'object') {
+    currentResult.value = draft.current_result as Record<string, unknown>
+  }
+  if (typeof draft.verification_digest === 'string') step2VerificationDigest.value = draft.verification_digest
+  if (Array.isArray(draft.parse_warnings)) step2ParseWarnings.value = draft.parse_warnings.map(String)
+  if (Array.isArray(draft.model_comparisons)) step2ModelComparisons.value = draft.model_comparisons as typeof step2ModelComparisons.value
+  if (Array.isArray(draft.source_index)) step2SourceIndex.value = draft.source_index as typeof step2SourceIndex.value
+  if (Array.isArray(draft.media_metadata)) step2MediaMetadata.value = draft.media_metadata as typeof step2MediaMetadata.value
+  if (Array.isArray(draft.docs_metadata)) step2DocsMetadata.value = draft.docs_metadata as typeof step2DocsMetadata.value
+  if (typeof draft.status_text === 'string') step2StatusText.value = draft.status_text
+  if (Array.isArray(draft.default_categories)) step2DefaultCategories.value = draft.default_categories.map(String)
+  if (Array.isArray(draft.extra_categories)) step2ExtraCategories.value = draft.extra_categories.map(String)
+  if (draft.review_mode === 'approve' || draft.review_mode === 'modify') step2ReviewMode.value = draft.review_mode
+  if (typeof draft.review_feedback === 'string') step2ReviewFeedback.value = draft.review_feedback
+  if (typeof draft.verification_ack === 'boolean') step2VerificationAck.value = draft.verification_ack
+  if (typeof draft.active_compare_index === 'number') step2ActiveCompareIndex.value = draft.active_compare_index
+}
+
+function clearStep2DraftState() {
+  localStorage.removeItem(step2DraftKey.value)
+}
+
+function saveStep3DraftState() {
+  const draft = {
+    project_id: projectId.value,
+    skeleton_tasks: step3SkeletonTasks.value,
+    active_l2_index: step3ActiveL2Index.value,
+    l3_draft: step3L3Draft.value,
+    skeleton_phase: step3SkeletonPhase.value,
+    config: step3Config.value,
+    updated_at: new Date().toISOString(),
+  }
+  localStorage.setItem(step3DraftKey.value, JSON.stringify(draft))
+}
+
+function loadStep3DraftState(): Record<string, unknown> | null {
+  const raw = localStorage.getItem(step3DraftKey.value)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function restoreStep3DraftState(draft: Record<string, unknown>) {
+  if (Array.isArray(draft.skeleton_tasks) && draft.skeleton_tasks.length) {
+    step3SkeletonTasks.value = draft.skeleton_tasks as typeof step3SkeletonTasks.value
+  }
+  if (typeof draft.active_l2_index === 'number') {
+    step3ActiveL2Index.value = Math.max(0, Math.min(step3SkeletonTasks.value.length - 1, draft.active_l2_index))
+  }
+  if (typeof draft.l3_draft === 'string') {
+    step3L3Draft.value = draft.l3_draft
+  }
+  const phase = draft.skeleton_phase
+  if (phase === 'config' || phase === 'skeleton' || phase === 'generating_l3' || phase === 'completed') {
+    step3SkeletonPhase.value = phase
+  }
+  if (draft.config && typeof draft.config === 'object') {
+    const cfg = draft.config as Record<string, unknown>
+    if (typeof cfg.system_type === 'string') step3Config.value.system_type = cfg.system_type
+    if (typeof cfg.indicator_depth === 'number') step3Config.value.indicator_depth = cfg.indicator_depth as 3 | 4
+    if (typeof cfg.import_mode === 'string') step3Config.value.import_mode = cfg.import_mode
+    if (typeof cfg.template_id === 'string') step3Config.value.template_id = cfg.template_id
+    if (typeof cfg.skeleton_optimize_mode === 'string') step3Config.value.skeleton_optimize_mode = cfg.skeleton_optimize_mode
+  }
+}
+
+function clearStep3DraftState() {
+  localStorage.removeItem(step3DraftKey.value)
 }
 
 async function loadProjectFiles() {
@@ -976,6 +1278,7 @@ async function loadHistories() {
       title: `${item.title} v${item.version}`,
       desc: item.is_final ? '最终版本' : '草稿',
       content: item.content_text || item.content_json || '',
+      content_json: item.content_json || undefined,
     }))
   } catch {
     historyItems.value = []
@@ -1059,7 +1362,26 @@ async function loadResult() {
   if (stepId.value === 3) {
     try {
       const prevStep = await getStepResult('step2', projectId.value)
-      step3State.value = (prevStep.result as Record<string, unknown>) || null
+      const rawResult = (prevStep.result as Record<string, unknown>) || null
+      let step2Full: Record<string, unknown> | null = null
+      if (rawResult && typeof rawResult === 'object') {
+        const cj = rawResult.content_json
+        if (typeof cj === 'string' && cj.trim()) {
+          try {
+            const parsed = JSON.parse(cj)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              step2Full = parsed as Record<string, unknown>
+            }
+          } catch { /* ignore parse error */ }
+        }
+        if (!step2Full) {
+          step2Full = rawResult
+        }
+        if (step2Full && !step2Full.content_text && rawResult.content_text) {
+          step2Full.content_text = rawResult.content_text
+        }
+      }
+      step3State.value = step2Full
     } catch {
       step3State.value = null
     }
@@ -1085,11 +1407,44 @@ async function loadResult() {
     if (currentResult.value) {
       syncStep3FromResult(currentResult.value)
     }
+    // If backend has no step3 result yet, restore in-progress draft from localStorage.
+    if (!step3SkeletonTasks.value.length) {
+      const localDraft = loadStep3DraftState()
+      if (localDraft) {
+        restoreStep3DraftState(localDraft)
+      }
+    }
     finalizeStep3Workflow()
   } else if (stepId.value === 2) {
+    let restoredFromBackend = false
     try {
       const res = await getStepResult('step2', projectId.value)
-      const step2Result = (res.result as Record<string, unknown>) || null
+      const rawResult = (res.result as Record<string, unknown>) || null
+      // Backend wraps actual agent payload in StepOutput row; unwrap content_json for full state.
+      let step2Result: Record<string, unknown> | null = null
+      if (rawResult && typeof rawResult === 'object') {
+        const cj = rawResult.content_json
+        if (typeof cj === 'string' && cj.trim()) {
+          try {
+            const parsed = JSON.parse(cj)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              step2Result = parsed as Record<string, unknown>
+            }
+          } catch {
+            step2Result = null
+          }
+        }
+        if (!step2Result && (rawResult.model_comparisons || rawResult.verification_digest)) {
+          step2Result = rawResult
+        }
+        if (!step2Result && (rawResult.id || rawResult.content_text)) {
+          // Fallback: only the StepOutput row was returned, treat content_text as final core content.
+          step2Result = {
+            content_text: rawResult.content_text,
+            status: rawResult.status || 'saved',
+          }
+        }
+      }
       if (step2Result) {
         currentResult.value = step2Result
         resultText.value = JSON.stringify(step2Result, null, 2)
@@ -1098,10 +1453,15 @@ async function loadResult() {
           : []
         extractStep2State(step2Result, comparisons)
         step2DraftDirty.value = false
-        step2LastCommittedAt.value = (res as { updated_at?: string }).updated_at || step2LastCommittedAt.value
+        step2LastCommittedAt.value = (rawResult as { updated_at?: string } | null)?.updated_at || step2LastCommittedAt.value
+        restoredFromBackend = comparisons.length > 0 || Boolean(step2Result.verification_digest)
       }
     } catch {
       // step2 not generated yet
+    }
+    if (!restoredFromBackend) {
+      const localDraft = loadStep2DraftState()
+      if (localDraft) restoreStep2DraftState(localDraft)
     }
     try {
       const step1Res = await getStepResult('step1', projectId.value)
@@ -1118,17 +1478,66 @@ async function loadResult() {
     if (stepId.value === 4) {
       try {
         const step3Res = await getStepResult('step3', projectId.value)
-        const step3Result = (step3Res.result as Record<string, unknown>) || null
+        const rawResult = (step3Res.result as Record<string, unknown>) || null
+        if (rawResult && !rawResult.id && !rawResult.content_json && !rawResult.content_text) {
+          console.warn('[Step4] Step3 result is empty — step3 may not have been saved yet.', step3Res)
+        }
+        let step3Result: Record<string, unknown> | null = null
+        if (rawResult && typeof rawResult === 'object') {
+          const cj = rawResult.content_json
+          if (typeof cj === 'string' && cj.trim()) {
+            try {
+              const parsed = JSON.parse(cj)
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                step3Result = parsed as Record<string, unknown>
+              }
+            } catch { /* ignore */ }
+          }
+          if (!step3Result) step3Result = rawResult
+        }
         if (step3Result) {
-          const tasks = step3Result.flat_l2_tasks
-          if (Array.isArray(tasks)) {
+          let tasks = step3Result.flat_l2_tasks
+          // Fallback: derive from skeleton / level2_items if flat_l2_tasks is missing (old save format).
+          if (!Array.isArray(tasks) || !tasks.length) {
+            const skeleton = step3Result.skeleton
+            if (Array.isArray(skeleton) && skeleton.length) {
+              tasks = skeleton
+            }
+          }
+          if (!Array.isArray(tasks) || !tasks.length) {
+            const level2Items = step3Result.level2Items || step3Result.level2_items
+            if (Array.isArray(level2Items) && level2Items.length) {
+              tasks = level2Items
+            }
+          }
+          // Final fallback: parse from content_text markdown (format: ### N. 一级：X ｜ 二级：Y)
+          if (!Array.isArray(tasks) || !tasks.length) {
+            const mdText = (step3Result.content_text || rawResult?.content_text || '') as string
+            if (typeof mdText === 'string' && mdText.includes('一级：')) {
+              const regex = /###\s*\d+\.\s*一级[：:]\s*(.+?)\s*[｜|]\s*二级[：:]\s*(.+)/g
+              const extracted: Array<{ level1_name: string; level2_name: string }> = []
+              let match: RegExpExecArray | null
+              while ((match = regex.exec(mdText)) !== null) {
+                extracted.push({ level1_name: match[1].trim(), level2_name: match[2].trim() })
+              }
+              if (extracted.length) tasks = extracted
+            }
+          }
+          if (Array.isArray(tasks) && tasks.length) {
             step4FlatL2Tasks.value = tasks.map((t: any) => ({
-              level1_name: String(t.level1_name || ''),
-              level2_name: String(t.level2_name || ''),
+              level1_name: String(t.level1_name || t.level1 || t.parent_name || ''),
+              level2_name: String(t.level2_name || t.level2 || t.name || t.indicator_name || ''),
               level3_name: t.level3_name ? String(t.level3_name) : undefined,
               weight: typeof t.weight === 'number' ? t.weight : undefined,
               score: undefined,
+              target_l3_count: typeof t.target_l3_count === 'number' ? t.target_l3_count : undefined,
+              l3_section_markdown: typeof t.l3_section_markdown === 'string' ? t.l3_section_markdown : undefined,
             }))
+          }
+          // Also store step3 content_text for agent payload context.
+          const step3Text = step3Result.content_text || step3Result.final_indicator_markdown || rawResult?.content_text
+          if (typeof step3Text === 'string' && step3Text.trim()) {
+            prevStepContent.value = step3Text
           }
         }
       } catch {
@@ -1138,26 +1547,162 @@ async function loadResult() {
       try {
         const prevCode = `step${stepId.value - 1}`
         const prevRes = await getStepResult(prevCode, projectId.value)
-        const prevResult = (prevRes.result as Record<string, unknown>) || null
+        const rawResult = (prevRes.result as Record<string, unknown>) || null
+        let prevResult: Record<string, unknown> | null = null
+        if (rawResult && typeof rawResult === 'object') {
+          const cj = rawResult.content_json
+          if (typeof cj === 'string' && cj.trim()) {
+            try {
+              const parsed = JSON.parse(cj)
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                prevResult = parsed as Record<string, unknown>
+              }
+            } catch { /* ignore */ }
+          }
+          if (!prevResult) prevResult = rawResult
+          if (prevResult && !prevResult.content_text && rawResult.content_text) {
+            prevResult.content_text = rawResult.content_text
+          }
+        }
         if (prevResult) {
           const text = prevResult.content_text || prevResult.final_core_content || prevResult.final_indicator_markdown || ''
           prevStepContent.value = typeof text === 'string' ? text : ''
+          prevStepResult.value = prevResult
+        }
+        // step7+ 依赖 step4 的 scored_tree 与 step5 的 score_standards。
+        // 如果 step6 保存时漏了这两份（旧版 step6 保存逻辑），这里回源到 step4/step5 补齐到 prevStepResult，
+        // 让 buildGenericAgentPayload 的 pass-through 仍能拿到，避免 step7 graph 报"缺少第四步成果"。
+        if (stepId.value >= 7) {
+          const merged: Record<string, unknown> = (prevStepResult.value as Record<string, unknown>) ? { ...(prevStepResult.value as Record<string, unknown>) } : {}
+          if (!Array.isArray(merged['scored_tree']) || !(merged['scored_tree'] as unknown[]).length) {
+            try {
+              const s4 = await getStepResult('step4', projectId.value)
+              const s4Raw = (s4.result as Record<string, unknown>) || null
+              if (s4Raw && typeof s4Raw.content_json === 'string') {
+                const s4Parsed = JSON.parse(s4Raw.content_json)
+                if (s4Parsed && Array.isArray(s4Parsed.scored_tree)) {
+                  merged['scored_tree'] = s4Parsed.scored_tree
+                }
+                if (s4Parsed && typeof s4Parsed.project_core_content === 'string' && !merged['project_core_content']) {
+                  merged['project_core_content'] = s4Parsed.project_core_content
+                }
+              }
+            } catch { /* ignore */ }
+          }
+          if (!Array.isArray(merged['score_standards']) || !(merged['score_standards'] as unknown[]).length) {
+            try {
+              const s5 = await getStepResult('step5', projectId.value)
+              const s5Raw = (s5.result as Record<string, unknown>) || null
+              if (s5Raw && typeof s5Raw.content_json === 'string') {
+                const s5Parsed = JSON.parse(s5Raw.content_json)
+                if (s5Parsed && Array.isArray(s5Parsed.score_standards)) {
+                  merged['score_standards'] = s5Parsed.score_standards
+                }
+                if (s5Parsed && Array.isArray(s5Parsed.scored_tree) && (!Array.isArray(merged['scored_tree']) || !(merged['scored_tree'] as unknown[]).length)) {
+                  merged['scored_tree'] = s5Parsed.scored_tree
+                }
+              }
+            } catch { /* ignore */ }
+          }
+          prevStepResult.value = { ...merged }
         }
       } catch {
         prevStepContent.value = ''
+        prevStepResult.value = null
       }
     }
     try {
       const res = await getStepResult(stepCodeOf(), projectId.value)
       const saved = (res.result as Record<string, unknown>) || null
       if (saved) {
-        currentResult.value = saved
-        resultText.value = JSON.stringify(saved, null, 2)
+        // content_json 里封了 step 自己的结构化字段（scored_tree / questionnaire_items 等），
+        // 必须反序列化合并回 currentResult，否则前端只能看到 content_text/version 这几个外壳字段
+        let parsedContentJson: Record<string, unknown> | null = null
+        if (typeof saved.content_json === 'string' && saved.content_json.trim()) {
+          try {
+            const parsed = JSON.parse(saved.content_json)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              parsedContentJson = parsed as Record<string, unknown>
+            }
+          } catch {
+            parsedContentJson = null
+          }
+        }
+        currentResult.value = parsedContentJson ? { ...saved, ...parsedContentJson } : saved
+        resultText.value = JSON.stringify(currentResult.value, null, 2)
         const text = (saved.content_text as string) || readStep3FinishText(saved)
         if (typeof text === 'string' && text.trim()) editor.value = text
+        // step6：从持久化的 content_json 把问卷 ref 回填，避免历史恢复后界面看不到问卷
+        if (stepId.value === 6 && parsedContentJson) {
+          const decision = parsedContentJson['questionnaire_decision']
+          if (decision === 'need' || decision === 'skip') {
+            step6QuestionnaireDecision.value = decision
+          }
+          const feedback = parsedContentJson['questionnaire_feedback']
+          if (typeof feedback === 'string') step6QuestionnaireFeedback.value = feedback
+          const qDraft = parsedContentJson['questionnaire_draft']
+          if (typeof qDraft === 'string') step6QuestionnaireDraft.value = qDraft
+          const qItems = parsedContentJson['questionnaire_items']
+          if (Array.isArray(qItems)) step6QuestionnaireItems.value = qItems as Step6QItem[]
+          loadStep6Responses()
+        }
+        // step4 刷新页面时从 saved 的 scored_tree 回填 score 到 step4FlatL2Tasks
+        if (stepId.value === 4 && step4FlatL2Tasks.value.length) {
+          const treeSource = (parsedContentJson && parsedContentJson['scored_tree']) ?? saved['scored_tree']
+          const scoredTree = treeSource
+          if (Array.isArray(scoredTree) && scoredTree.length) {
+            const l2ScoreByKey: Record<string, number> = {}
+            for (const l1 of scoredTree as any[]) {
+              const l1Name = String(l1?.name ?? '')
+              const level2List = Array.isArray(l1?.level2) ? l1.level2 : []
+              for (const l2 of level2List) {
+                const l2Name = String(l2?.name ?? '')
+                const sc = typeof l2?.score === 'number' ? l2.score : Number(l2?.score)
+                if (!Number.isNaN(sc)) l2ScoreByKey[`${l1Name}|${l2Name}`] = Number(sc)
+              }
+            }
+            if (Object.keys(l2ScoreByKey).length) {
+              step4FlatL2Tasks.value = step4FlatL2Tasks.value.map((row) => {
+                const key = `${row.level1_name}|${row.level2_name}`
+                const matched = l2ScoreByKey[key]
+                return matched !== undefined ? { ...row, score: matched } : row
+              })
+              const scores: Record<string, number> = {}
+              for (const t of step4FlatL2Tasks.value) {
+                if (t.score !== undefined) scores[`${t.level1_name}|${t.level2_name}`] = t.score
+              }
+              if (Object.keys(scores).length > 0) step4ManualScores.value = scores
+            }
+          }
+          if (typeof saved['total_score'] === 'number') {
+            step4TotalScore.value = saved['total_score'] as number
+          } else if (parsedContentJson && typeof parsedContentJson['total_score'] === 'number') {
+            step4TotalScore.value = parsedContentJson['total_score'] as number
+          }
+        }
+      } else if (stepId.value >= 4) {
+        // 后端未提交版本时，回退读取 localStorage 短期草稿（双保险）
+        const draft = loadGenericStepDraft(stepCodeOf())
+        if (draft) {
+          if (typeof draft.content_text === 'string') editor.value = draft.content_text
+          if (typeof draft.content_json === 'string') resultText.value = draft.content_json
+          if (draft.current_result && typeof draft.current_result === 'object') {
+            currentResult.value = draft.current_result as Record<string, unknown>
+          }
+        }
       }
     } catch {
       // no saved result for this step yet
+      if (stepId.value >= 4) {
+        const draft = loadGenericStepDraft(stepCodeOf())
+        if (draft) {
+          if (typeof draft.content_text === 'string') editor.value = draft.content_text
+          if (typeof draft.content_json === 'string') resultText.value = draft.content_json
+          if (draft.current_result && typeof draft.current_result === 'object') {
+            currentResult.value = draft.current_result as Record<string, unknown>
+          }
+        }
+      }
     }
   }
 }
@@ -1307,6 +1852,7 @@ function applyStep2Comparison(index: number) {
   }
   editor.value = item.draft
   step2ActiveCompareIndex.value = index
+  saveStep2DraftState()
   ElMessage.success(`已把「${item.label || item.model_name || `模型 ${index + 1}`}」草稿导入成品区`)
 }
 
@@ -1342,17 +1888,33 @@ async function approveStep2() {
           thread_id: step2ThreadId.value,
           values: { final_core_content: editor.value, status: 'committed' },
         })
+        const fullState = {
+          ...(currentResult.value ?? {}),
+          final_core_content: editor.value,
+          content_text: editor.value,
+          status: 'committed',
+          model_comparisons: step2ModelComparisons.value,
+          verification_digest: step2VerificationDigest.value,
+          parse_warnings: step2ParseWarnings.value,
+          source_index: step2SourceIndex.value,
+          media_metadata: step2MediaMetadata.value,
+          text_doc_metadata: step2DocsMetadata.value,
+          default_categories: step2DefaultCategories.value,
+          extra_categories: step2ExtraCategories.value,
+        }
         await saveStepResult('step2', {
           project_id: projectId.value,
           title: titleMap[2],
           content_text: editor.value,
-          content_json: resultText.value || '{}',
+          content_json: JSON.stringify(fullState),
           model_name: 'manual-edit',
         })
         step2DraftDirty.value = false
         step2LastCommittedAt.value = new Date().toISOString()
         step2ReviewMode.value = 'approve'
         step2ReviewFeedback.value = ''
+        clearStep2DraftState()
+        await clearStepShortTermMemory('step2', step2ThreadId.value)
         await loadWorkflowStatus()
         ElMessage.success('Step2 核心内容已确认提交到数据库')
       } catch (e) {
@@ -1369,6 +1931,7 @@ function step2WriteBackToCheckpointer() {
   if (step2WriteBackTimer) clearTimeout(step2WriteBackTimer)
   step2WriteBackTimer = setTimeout(async () => {
     if (stepId.value !== 2 || isEditorEmpty()) return
+    saveStep2DraftState()
     try {
       await updateThreadState({
         step_code: 'step2',
@@ -1451,6 +2014,76 @@ async function submitStep2Export(downloadAfter = true) {
   }
 }
 
+function renderStep4ScoredMarkdown(scoredTree: any[], totalScore: number, project: string): string {
+  const title = (project || '项目').trim()
+  const fmtInt = (v: any) => {
+    const n = Number(v)
+    return Number.isFinite(n) ? String(Math.round(n)) : '0'
+  }
+  const esc = (s: any) => String(s ?? '').replace(/\|/g, '丨').replace(/\n/g, ' ').trim()
+
+  const lines: string[] = []
+  lines.push(`# 《${title} — 评估指标分值表》`)
+  lines.push('')
+  if (typeof totalScore === 'number' && !Number.isNaN(totalScore)) {
+    lines.push(`> 总分：${fmtInt(totalScore)}`)
+    lines.push('')
+  }
+  lines.push('| 一级指标 | 一级总分 | 二级指标 | 二级总分 | 具体观测点/三级指标 | 观测点分值 | 核心考核要点 |')
+  lines.push('| --- | :---: | --- | :---: | --- | :---: | --- |')
+
+  let grandL1 = 0
+  let grandL2 = 0
+  let grandL3 = 0
+
+  for (const l1 of Array.isArray(scoredTree) ? scoredTree : []) {
+    const l1Name = esc(l1?.name)
+    const l1Score = fmtInt(l1?.score)
+    grandL1 += Number(l1Score)
+    let l1Emitted = false
+
+    const l2List: any[] = Array.isArray(l1?.level2) ? l1.level2 : []
+    if (!l2List.length) {
+      lines.push(`| ${l1Name} | ${l1Score} | — | — | — | — | — |`)
+      continue
+    }
+
+    for (const l2 of l2List) {
+      const l2Name = esc(l2?.name)
+      const l2Score = fmtInt(l2?.score)
+      grandL2 += Number(l2Score)
+      let l2Emitted = false
+
+      const l3List: any[] = Array.isArray(l2?.level3) ? l2.level3 : []
+      if (!l3List.length) {
+        const leftL1 = l1Emitted ? '' : l1Name
+        const leftL1Score = l1Emitted ? '' : l1Score
+        lines.push(`| ${leftL1} | ${leftL1Score} | ${l2Name} | ${l2Score} | — | — | — |`)
+        l1Emitted = true
+        continue
+      }
+
+      for (const l3 of l3List) {
+        const l3Name = esc(l3?.name)
+        const l3Score = fmtInt(l3?.score)
+        grandL3 += Number(l3Score)
+        const kp = esc(l3?.key_points || l3?.description || '')
+        const leftL1 = l1Emitted ? '' : l1Name
+        const leftL1Score = l1Emitted ? '' : l1Score
+        const leftL2 = l2Emitted ? '' : l2Name
+        const leftL2Score = l2Emitted ? '' : l2Score
+        lines.push(`| ${leftL1} | ${leftL1Score} | ${leftL2} | ${leftL2Score} | ${l3Name} | ${l3Score} | ${kp} |`)
+        l1Emitted = true
+        l2Emitted = true
+      }
+    }
+  }
+
+  lines.push(`| **合计** | **${grandL1}** | — | **${grandL2}** | — | **${grandL3}** | — |`)
+  lines.push('')
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n'
+}
+
 function applyAgentResult(res: AgentRunResponse) {
   const payload = extractResult(res)
   currentResult.value = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null
@@ -1474,29 +2107,100 @@ function applyAgentResult(res: AgentRunResponse) {
   if (stepId.value === 2) {
     extractStep2State(currentResult.value, comparisons)
     step2DraftDirty.value = true
+    saveStep2DraftState()
   }
 
   if (stepId.value === 4 && currentResult.value) {
     const tasks = currentResult.value['flat_l2_tasks']
-    if (Array.isArray(tasks)) {
+    if (Array.isArray(tasks) && tasks.length) {
       step4FlatL2Tasks.value = tasks.map((t: any) => ({
         level1_name: String(t.level1_name || ''),
         level2_name: String(t.level2_name || ''),
         level3_name: t.level3_name ? String(t.level3_name) : undefined,
         weight: typeof t.weight === 'number' ? t.weight : undefined,
         score: typeof t.score === 'number' ? t.score : undefined,
+        target_l3_count: typeof t.target_l3_count === 'number' ? t.target_l3_count : undefined,
+        l3_section_markdown: typeof t.l3_section_markdown === 'string' ? t.l3_section_markdown : undefined,
       }))
-      const scores: Record<string, number> = {}
-      for (const t of step4FlatL2Tasks.value) {
-        if (t.score !== undefined) {
-          scores[`${t.level1_name}|${t.level2_name}`] = t.score
+    }
+    // 后端 step4 实际产出的是 scored_tree（L1 -> L2 -> L3 的分层树），需要展平回 L2 名 -> 分值
+    const scoredTree = currentResult.value['scored_tree']
+    if (Array.isArray(scoredTree) && scoredTree.length && step4FlatL2Tasks.value.length) {
+      const l2ScoreByKey: Record<string, number> = {}
+      for (const l1 of scoredTree as any[]) {
+        const l1Name = String(l1?.name ?? '')
+        const level2List = Array.isArray(l1?.level2) ? l1.level2 : []
+        for (const l2 of level2List) {
+          const l2Name = String(l2?.name ?? '')
+          const sc = typeof l2?.score === 'number' ? l2.score : Number(l2?.score)
+          if (!Number.isNaN(sc)) {
+            l2ScoreByKey[`${l1Name}|${l2Name}`] = Number(sc)
+          }
         }
       }
-      if (Object.keys(scores).length > 0) step4ManualScores.value = scores
+      if (Object.keys(l2ScoreByKey).length) {
+        step4FlatL2Tasks.value = step4FlatL2Tasks.value.map((row) => {
+          const key = `${row.level1_name}|${row.level2_name}`
+          const matched = l2ScoreByKey[key]
+          return matched !== undefined ? { ...row, score: matched } : row
+        })
+      }
     }
+    const scores: Record<string, number> = {}
+    for (const t of step4FlatL2Tasks.value) {
+      if (t.score !== undefined) {
+        scores[`${t.level1_name}|${t.level2_name}`] = t.score
+      }
+    }
+    if (Object.keys(scores).length > 0) step4ManualScores.value = scores
     if (typeof currentResult.value['total_score'] === 'number') {
       step4TotalScore.value = currentResult.value['total_score'] as number
     }
+
+    // 将分值合并进介质文本：优先用后端 final_scores_markdown，否则按 scored_tree 自渲染一份带分值的 Markdown 写回 editor
+    const backendFinalMd = currentResult.value['final_scores_markdown']
+    if (typeof backendFinalMd === 'string' && backendFinalMd.trim()) {
+      editor.value = backendFinalMd
+    } else if (Array.isArray(scoredTree) && scoredTree.length) {
+      editor.value = renderStep4ScoredMarkdown(scoredTree as any[], step4TotalScore.value, projectName.value)
+    }
+  }
+
+  if (stepId.value === 5 && currentResult.value) {
+    // step5：评分标准 markdown 优先取 final_rubrics_markdown，未定稿时取 draft_rubrics_markdown
+    const finalRubric = currentResult.value['final_rubrics_markdown']
+    const draftRubric = currentResult.value['draft_rubrics_markdown']
+    const contentText = currentResult.value['content_text']
+    const md = (typeof finalRubric === 'string' && finalRubric.trim())
+      ? finalRubric
+      : (typeof draftRubric === 'string' && draftRubric.trim())
+        ? draftRubric
+        : (typeof contentText === 'string' ? contentText : '')
+    if (md && md.trim()) {
+      editor.value = md
+    }
+  }
+
+  if (stepId.value === 6 && currentResult.value) {
+    // step6：指标体系 markdown + 可选问卷草稿
+    const frameworkMd = currentResult.value['final_indicator_framework_markdown']
+    const exportPayload = currentResult.value['export_payload']
+    const contentText = currentResult.value['content_text']
+    const baseMd = (typeof frameworkMd === 'string' && frameworkMd.trim())
+      ? frameworkMd
+      : (typeof exportPayload === 'string' && exportPayload.trim())
+        ? exportPayload
+        : (typeof contentText === 'string' ? contentText : '')
+    if (baseMd && baseMd.trim()) {
+      editor.value = baseMd
+    }
+    const qDraft = currentResult.value['questionnaire_draft']
+    step6QuestionnaireDraft.value = typeof qDraft === 'string' ? qDraft : ''
+    const qItems = currentResult.value['questionnaire_items']
+    step6QuestionnaireItems.value = Array.isArray(qItems) ? qItems as Step6QItem[] : []
+    // 解析 scored_tree → 拖拽 ref，并在 DOM 渲染后挂载 sortable
+    parseScoredTreeIntoStep6Tree()
+    nextTick(() => mountStep6Sortables())
   }
 
   const structuredSummaries = [
@@ -1575,6 +2279,20 @@ async function saveCurrentStep() {
           })
           clearStep1DraftState()
           await loadProjectFiles()
+          // Also persist as StepOutput so workflow progress reflects step1 completion.
+          try {
+            await saveStepResult('step1', {
+              project_id: projectId.value,
+              title: titleMap[1] ?? 'Step1 · 项目资料清单',
+              content_text: editor.value,
+              content_json: resultText.value || '{}',
+              model_name: 'manual-edit',
+            })
+            await clearStepShortTermMemory('step1', step1ThreadId.value)
+          } catch (e) {
+            console.warn('saveStepResult step1 failed', e)
+          }
+          await loadWorkflowStatus()
           ElMessage.success('Step1 草稿已确认并完成提交')
         } catch (e) {
           ElMessage.error(e instanceof Error ? e.message : '提交失败')
@@ -1600,6 +2318,7 @@ async function saveCurrentStep() {
         const step3Json = stepId.value === 3
           ? JSON.stringify({
               ...step3Structured.value,
+              flat_l2_tasks: step3SkeletonTasks.value,
               review_mode: step3Config.value.review_mode,
               review_feedback: step3Config.value.review_feedback,
               system_type: step3Config.value.system_type,
@@ -1611,12 +2330,98 @@ async function saveCurrentStep() {
             }, null, 2)
           : stepId.value === 4
             ? JSON.stringify({
-                flat_l2_tasks: step4FlatL2Tasks.value,
-                scoring_mode: step4ScoringMode.value,
-                manual_scores: step4ManualScores.value,
+                flat_l2_tasks: step4FlatL2Tasks.value.map((t) => ({
+                  level1_name: t.level1_name,
+                  level2_name: t.level2_name,
+                  target_l3_count: t.target_l3_count ?? 1,
+                  l3_section_markdown: t.l3_section_markdown ?? '',
+                  score: typeof t.score === 'number' ? t.score : undefined,
+                })),
+                assign_mode: step4ScoringMode.value === 'ai' ? 'llm' : 'manual',
+                manual_l3_scores: step4ManualScores.value,
                 total_score: step4TotalScore.value,
+                // 关键：把后端 step4 graph 产出的 scored_tree 一并持久化，否则历史恢复后 score 字段全部丢失，
+                // 同时 step5 也拿不到 scored_tree 会直接报错
+                scored_tree: (currentResult.value && Array.isArray((currentResult.value as Record<string, unknown>)['scored_tree']))
+                  ? (currentResult.value as Record<string, unknown>)['scored_tree']
+                  : [],
+                final_indicator_markdown: (currentResult.value && typeof (currentResult.value as Record<string, unknown>)['final_indicator_markdown'] === 'string')
+                  ? (currentResult.value as Record<string, unknown>)['final_indicator_markdown']
+                  : (prevStepContent.value || ''),
               }, null, 2)
-            : resultText.value || '{}'
+            : stepId.value === 6
+              ? JSON.stringify({
+                  // step6 现场评价表 + 满意度问卷一并落库，否则历史恢复后问卷与指标体系都会丢失
+                  final_indicator_framework_markdown:
+                    (currentResult.value && typeof (currentResult.value as Record<string, unknown>)['final_indicator_framework_markdown'] === 'string')
+                      ? (currentResult.value as Record<string, unknown>)['final_indicator_framework_markdown']
+                      : (editor.value || ''),
+                  questionnaire_decision: step6QuestionnaireDecision.value,
+                  questionnaire_feedback: step6QuestionnaireFeedback.value,
+                  questionnaire_draft: step6QuestionnaireDraft.value,
+                  questionnaire_items: step6QuestionnaireItems.value,
+                  compressed_rubrics:
+                    (currentResult.value && typeof (currentResult.value as Record<string, unknown>)['compressed_rubrics'] === 'object')
+                      ? (currentResult.value as Record<string, unknown>)['compressed_rubrics']
+                      : {},
+                  export_payload:
+                    (currentResult.value && typeof (currentResult.value as Record<string, unknown>)['export_payload'] === 'string')
+                      ? (currentResult.value as Record<string, unknown>)['export_payload']
+                      : '',
+                  // 关键：step7+ 依赖 step4 的 scored_tree 与 step5 的 score_standards，
+                  // step6 保存时必须把这两份一并落库，否则后续 step 的 prev pass-through 拿不到，会直接报"缺少第四步成果"
+                  scored_tree:
+                    (currentResult.value && Array.isArray((currentResult.value as Record<string, unknown>)['scored_tree']))
+                      ? (currentResult.value as Record<string, unknown>)['scored_tree']
+                      : ((prevStepResult.value && Array.isArray((prevStepResult.value as Record<string, unknown>)['scored_tree']))
+                        ? (prevStepResult.value as Record<string, unknown>)['scored_tree']
+                        : []),
+                  score_standards:
+                    (currentResult.value && Array.isArray((currentResult.value as Record<string, unknown>)['score_standards']))
+                      ? (currentResult.value as Record<string, unknown>)['score_standards']
+                      : ((prevStepResult.value && Array.isArray((prevStepResult.value as Record<string, unknown>)['score_standards']))
+                        ? (prevStepResult.value as Record<string, unknown>)['score_standards']
+                        : []),
+                  project_core_content:
+                    (currentResult.value && typeof (currentResult.value as Record<string, unknown>)['project_core_content'] === 'string')
+                      ? (currentResult.value as Record<string, unknown>)['project_core_content']
+                      : ((prevStepResult.value && typeof (prevStepResult.value as Record<string, unknown>)['project_core_content'] === 'string')
+                        ? (prevStepResult.value as Record<string, unknown>)['project_core_content']
+                        : ''),
+                }, null, 2)
+            : stepId.value === 7
+              ? JSON.stringify({
+                  // step7 指标体系分析与得分表：分析行 + 4 块 5 列表 + 总评分表 6 列 + 级联得分
+                  indicator_form: step7Form.value,
+                  indicator_inputs: step7Inputs.value,
+                  analysis_rows: step7AnalysisRows.value,
+                  block_tables_markdown: step7BlockMd.value,
+                  overall_score_table_markdown: step7OverallMd.value,
+                  total_score: step7TotalScore.value,
+                  total_full_score: step7TotalFull.value,
+                  overall_score_rate: step7OverallRate.value,
+                  survey_summary: step7SurveySummary.value,
+                  survey_sample_size: step7SurveySample.value,
+                  survey_satisfaction_rate: step7SurveyRate.value,
+                  export_font_family: step7ExportFontFamily.value,
+                  export_font_size: step7ExportFontSize.value,
+                  export_line_height: step7ExportLineHeight.value,
+                  // 把上游字段一并保留，供 step8+ pass-through 使用
+                  scored_tree:
+                    (prevStepResult.value && Array.isArray((prevStepResult.value as Record<string, unknown>)['scored_tree']))
+                      ? (prevStepResult.value as Record<string, unknown>)['scored_tree']
+                      : [],
+                  score_standards:
+                    (prevStepResult.value && Array.isArray((prevStepResult.value as Record<string, unknown>)['score_standards']))
+                      ? (prevStepResult.value as Record<string, unknown>)['score_standards']
+                      : [],
+                  project_core_content:
+                    (prevStepResult.value && typeof (prevStepResult.value as Record<string, unknown>)['project_core_content'] === 'string')
+                      ? (prevStepResult.value as Record<string, unknown>)['project_core_content']
+                      : '',
+                  final_score_sheet_markdown: editor.value,
+                }, null, 2)
+              : resultText.value || '{}'
         const saved = await saveStepResult(stepCodeOf(), {
           project_id: projectId.value,
           title: titleMap[stepId.value] ?? `Step ${stepId.value} 输出`,
@@ -1652,6 +2457,9 @@ async function saveCurrentStep() {
           content: saved.content_text,
         }]
         ElMessage.success(`已保存最终版本 v${saved.version}`)
+        if (stepId.value === 3) clearStep3DraftState()
+        if (stepId.value === 7) clearStep7DraftState()
+        await clearStepShortTermMemory(stepCodeOf(), `${stepCodeOf()}:${projectId.value}`)
         await Promise.all([loadHistories(), loadWorkflowStatus()])
       } catch (e) {
         ElMessage.error(e instanceof Error ? e.message : '保存失败')
@@ -1716,8 +2524,60 @@ function restoreHistory(idx: number) {
   const item = historyItems.value[idx]
   if (!item) return
   editor.value = item.content
-  resultText.value = item.content
+  resultText.value = item.content_json || item.content
   historyOpen.value = false
+
+  // step4 恢复时从 content_json 回填 scored_tree → score 到表格
+  if (stepId.value === 4 && item.content_json) {
+    try {
+      const parsed = JSON.parse(item.content_json)
+      if (parsed && typeof parsed === 'object') {
+        currentResult.value = parsed as Record<string, unknown>
+        // 从 flat_l2_tasks 恢复 score
+        const tasks = parsed.flat_l2_tasks
+        if (Array.isArray(tasks) && tasks.length) {
+          step4FlatL2Tasks.value = tasks.map((t: any) => ({
+            level1_name: String(t.level1_name || ''),
+            level2_name: String(t.level2_name || ''),
+            level3_name: t.level3_name ? String(t.level3_name) : undefined,
+            weight: typeof t.weight === 'number' ? t.weight : undefined,
+            score: typeof t.score === 'number' ? t.score : undefined,
+            target_l3_count: typeof t.target_l3_count === 'number' ? t.target_l3_count : undefined,
+            l3_section_markdown: typeof t.l3_section_markdown === 'string' ? t.l3_section_markdown : undefined,
+          }))
+        }
+        // 从 scored_tree 展平回填 score（优先级高于 flat_l2_tasks 里的 score）
+        const scoredTree = parsed.scored_tree
+        if (Array.isArray(scoredTree) && scoredTree.length && step4FlatL2Tasks.value.length) {
+          const l2ScoreByKey: Record<string, number> = {}
+          for (const l1 of scoredTree) {
+            const l1Name = String(l1?.name ?? '')
+            const level2List = Array.isArray(l1?.level2) ? l1.level2 : []
+            for (const l2 of level2List) {
+              const l2Name = String(l2?.name ?? '')
+              const sc = typeof l2?.score === 'number' ? l2.score : Number(l2?.score)
+              if (!Number.isNaN(sc)) l2ScoreByKey[`${l1Name}|${l2Name}`] = Number(sc)
+            }
+          }
+          if (Object.keys(l2ScoreByKey).length) {
+            step4FlatL2Tasks.value = step4FlatL2Tasks.value.map((row) => {
+              const key = `${row.level1_name}|${row.level2_name}`
+              const matched = l2ScoreByKey[key]
+              return matched !== undefined ? { ...row, score: matched } : row
+            })
+          }
+        }
+        // 同步 manualScores
+        const scores: Record<string, number> = {}
+        for (const t of step4FlatL2Tasks.value) {
+          if (t.score !== undefined) scores[`${t.level1_name}|${t.level2_name}`] = t.score
+        }
+        if (Object.keys(scores).length > 0) step4ManualScores.value = scores
+        if (typeof parsed.total_score === 'number') step4TotalScore.value = parsed.total_score
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
   ElMessage.success('已恢复到成品区')
 }
 
@@ -1833,7 +2693,21 @@ function buildStep3AgentPayload() {
 
 function buildGenericAgentPayload() {
   const files = buildAgentPayloadFiles()
+  // 把上一步的结构化结果（如 step4 的 scored_tree、step5 的 score_standards 等）透传给当前 step graph，
+  // 避免 stepN 因找不到 stepN-1 在 state 里的关键字段而报错。仅保留可序列化字段。
+  const prev = prevStepResult.value || {}
+  const prevPassThrough: Record<string, unknown> = {}
+  if (prev && typeof prev === 'object') {
+    for (const key of Object.keys(prev)) {
+      if (key === 'messages' || key === 'content_json') continue
+      const val = (prev as Record<string, unknown>)[key]
+      if (val === null || val === undefined) continue
+      if (typeof val === 'function') continue
+      prevPassThrough[key] = val
+    }
+  }
   return {
+    ...prevPassThrough,
     project_id: projectId.value,
     step_code: stepCodeOf(),
     title: titleMap[stepId.value] ?? `Step ${stepId.value}`,
@@ -1850,24 +2724,885 @@ function buildGenericAgentPayload() {
   }
 }
 
+// ===== Step 7 业务方法 =====
+function step7DraftKey() {
+  return `ef_step7_draft:${projectId.value}:step7:${projectId.value}`
+}
+
+function saveStep7DraftState() {
+  if (!projectId.value) return
+  try {
+    localStorage.setItem(step7DraftKey(), JSON.stringify({
+      indicator_form: step7Form.value,
+      indicator_inputs: step7Inputs.value,
+      analysis_rows: step7AnalysisRows.value,
+      block_md: step7BlockMd.value,
+      overall_md: step7OverallMd.value,
+      final_md: step7FinalMd.value,
+      total_score: step7TotalScore.value,
+      total_full: step7TotalFull.value,
+      overall_rate: step7OverallRate.value,
+      review_feedback: step7ReviewFeedback.value,
+      survey_sample: step7SurveySample.value,
+      survey_rate: step7SurveyRate.value,
+      survey_summary: step7SurveySummary.value,
+      export_font_family: step7ExportFontFamily.value,
+      export_font_size: step7ExportFontSize.value,
+      export_line_height: step7ExportLineHeight.value,
+      _saved_at: Date.now(),
+    }))
+  } catch { /* ignore quota */ }
+}
+
+function loadStep7DraftState(): boolean {
+  if (!projectId.value) return false
+  const raw = localStorage.getItem(step7DraftKey())
+  if (!raw) return false
+  try {
+    const d = JSON.parse(raw)
+    if (Array.isArray(d.indicator_form)) step7Form.value = d.indicator_form
+    if (d.indicator_inputs && typeof d.indicator_inputs === 'object') step7Inputs.value = d.indicator_inputs
+    if (Array.isArray(d.analysis_rows)) step7AnalysisRows.value = d.analysis_rows
+    if (typeof d.block_md === 'string') step7BlockMd.value = d.block_md
+    if (typeof d.overall_md === 'string') step7OverallMd.value = d.overall_md
+    if (typeof d.final_md === 'string') step7FinalMd.value = d.final_md
+    if (typeof d.total_score === 'number') step7TotalScore.value = d.total_score
+    if (typeof d.total_full === 'number') step7TotalFull.value = d.total_full
+    if (typeof d.overall_rate === 'number') step7OverallRate.value = d.overall_rate
+    if (typeof d.review_feedback === 'string') step7ReviewFeedback.value = d.review_feedback
+    if (typeof d.survey_sample === 'number') step7SurveySample.value = d.survey_sample
+    if (typeof d.survey_rate === 'number') step7SurveyRate.value = d.survey_rate
+    if (typeof d.survey_summary === 'string') step7SurveySummary.value = d.survey_summary
+    if (typeof d.export_font_family === 'string') step7ExportFontFamily.value = d.export_font_family
+    if (typeof d.export_font_size === 'number') step7ExportFontSize.value = d.export_font_size
+    if (typeof d.export_line_height === 'number') step7ExportLineHeight.value = d.export_line_height
+    return true
+  } catch {
+    return false
+  }
+}
+
+function clearStep7DraftState() {
+  if (!projectId.value) return
+  localStorage.removeItem(step7DraftKey())
+}
+
+function step7BuildFormFromUpstream(): Step7IndicatorForm[] {
+  // 兜底：当后端 expand_points 还没返回时（首次进入），先在前端按相同规则展开 form schema
+  const prev = (prevStepResult.value || {}) as Record<string, unknown>
+  const tree = Array.isArray(prev['scored_tree']) ? prev['scored_tree'] as any[] : []
+  const stds = Array.isArray(prev['score_standards']) ? prev['score_standards'] as any[] : []
+  const stdById: Record<string, any> = {}
+  for (const s of stds) { if (s && s.id) stdById[String(s.id)] = s }
+  const splitRe = /[；;\n、]+/
+  const bulletRe = /^\s*(?:[-•·●▪◆◇○*]|\d+[\.\)、])\s*/
+  const forms: Step7IndicatorForm[] = []
+  for (const l1 of tree) {
+    for (const l2 of (l1?.level2 || [])) {
+      for (const l3 of (l2?.level3 || [])) {
+        const id = String(l3?.id || '')
+        const std = stdById[id] || {}
+        const score = Number(l3?.score || 0)
+        const kp = String(std.key_points || l3?.key_points || '')
+        const rubric = (std.rubric || l3?.rubric || {}) as Record<string, string>
+        const labels = (kp.split(splitRe).map((p: string) => p.replace(bulletRe, '').replace(/[：:。.，, ]+$/g, '').trim()).filter(Boolean))
+        const finalLabels = labels.length ? labels : ['整体执行情况']
+        const avg = Math.round((score / Math.max(finalLabels.length, 1)) * 100) / 100
+        const points: Step7PointSlot[] = finalLabels.map((label: string, idx: number) => ({
+          key: `P${idx + 1}`,
+          label,
+          hint: ((rubric['良好'] || rubric['合格'] || '') + '').slice(0, 120),
+          suggested_score: avg,
+        }))
+        forms.push({
+          id, l1_name: String(l1?.name || ''), l2_name: String(l2?.name || ''), l3_name: String(l3?.name || ''),
+          score, tag: String(l3?.tag || std.tag || '其他'), points, rubric,
+        })
+      }
+    }
+  }
+  return forms
+}
+
+function step7EnsureForm() {
+  if (!step7Form.value.length) {
+    step7Form.value = step7BuildFormFromUpstream()
+  }
+  // 同步 inputs：保留已填值，按 form 的 points 顺序补齐缺位
+  const next: Record<string, Step7PointInput[]> = {}
+  for (const form of step7Form.value) {
+    const old = step7Inputs.value[form.id] || []
+    const byKey: Record<string, Step7PointInput> = {}
+    for (const p of old) byKey[p.key] = p
+    next[form.id] = form.points.map((slot) => byKey[slot.key] || ({
+      key: slot.key, label: slot.label, plain_text: '', score: 0, deduction_reason: '',
+    }))
+  }
+  step7Inputs.value = next
+}
+
+async function step7BootstrapForm() {
+  if (step7Bootstrapping.value) return
+  step7Bootstrapping.value = true
+  try {
+    const cur: Record<string, unknown> = (prevStepResult.value as Record<string, unknown>)
+      ? { ...(prevStepResult.value as Record<string, unknown>) } : {}
+    const needTree = () => !Array.isArray(cur['scored_tree']) || !(cur['scored_tree'] as unknown[]).length
+    const needStds = () => !Array.isArray(cur['score_standards']) || !(cur['score_standards'] as unknown[]).length
+
+    // 1) 优先从持久化 step_output 取（用户已 save final 的情况）
+    if (needTree() && projectId.value) {
+      try {
+        const s4 = await getStepResult('step4', projectId.value)
+        const raw = (s4.result as Record<string, unknown>) || null
+        if (raw && typeof raw.content_json === 'string') {
+          const parsed = JSON.parse(raw.content_json)
+          if (parsed && Array.isArray(parsed.scored_tree)) cur['scored_tree'] = parsed.scored_tree
+          if (parsed && typeof parsed.project_core_content === 'string' && !cur['project_core_content']) {
+            cur['project_core_content'] = parsed.project_core_content
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    if (needStds() && projectId.value) {
+      try {
+        const s5 = await getStepResult('step5', projectId.value)
+        const raw = (s5.result as Record<string, unknown>) || null
+        if (raw && typeof raw.content_json === 'string') {
+          const parsed = JSON.parse(raw.content_json)
+          if (parsed && Array.isArray(parsed.score_standards)) cur['score_standards'] = parsed.score_standards
+          if (parsed && Array.isArray(parsed.scored_tree) && needTree()) {
+            cur['scored_tree'] = parsed.scored_tree
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // 2) fallback 去 LangGraph MemorySaver 短期记忆 thread 找草稿
+    //    （CLAUDE.md：step4/step5 未确认提交时只放短期记忆，step_output 是空的）
+    if (needTree() && projectId.value) {
+      try {
+        const t4 = await getThreadState({ step_code: 'step4', thread_id: `step4:${projectId.value}` })
+        const st4 = (t4?.state || {}) as Record<string, unknown>
+        if (Array.isArray(st4['scored_tree']) && (st4['scored_tree'] as unknown[]).length) {
+          cur['scored_tree'] = st4['scored_tree']
+        }
+        if (typeof st4['project_core_content'] === 'string' && !cur['project_core_content']) {
+          cur['project_core_content'] = st4['project_core_content']
+        }
+      } catch { /* ignore */ }
+    }
+    if (needStds() && projectId.value) {
+      try {
+        const t5 = await getThreadState({ step_code: 'step5', thread_id: `step5:${projectId.value}` })
+        const st5 = (t5?.state || {}) as Record<string, unknown>
+        if (Array.isArray(st5['score_standards']) && (st5['score_standards'] as unknown[]).length) {
+          cur['score_standards'] = st5['score_standards']
+        }
+        if (Array.isArray(st5['scored_tree']) && needTree()) {
+          cur['scored_tree'] = st5['scored_tree']
+        }
+      } catch { /* ignore */ }
+    }
+
+    prevStepResult.value = { ...cur }
+    step7Form.value = step7BuildFormFromUpstream()
+    step7EnsureForm()
+    if (!step7Form.value.length) {
+      ElMessage.warning('未识别到三级指标，请确认 Step 4 / Step 5 已生成（保存草稿或最终版本均可）。')
+    } else {
+      saveStep7DraftState()
+      ElMessage.success(`已构造 ${step7Form.value.length} 条三级指标录入表单。`)
+    }
+  } finally {
+    step7Bootstrapping.value = false
+  }
+}
+
+async function generateStep7Analysis() {
+  if (step7Generating.value) return
+  // 1) 先确保 prev 拥有 step4(scored_tree) + step5(score_standards)；缺哪一项就实时回源补齐。
+  const ensurePrev = async () => {
+    const cur: Record<string, unknown> = (prevStepResult.value as Record<string, unknown>) ? { ...(prevStepResult.value as Record<string, unknown>) } : {}
+    const needTree = !Array.isArray(cur['scored_tree']) || !(cur['scored_tree'] as unknown[]).length
+    const needStds = !Array.isArray(cur['score_standards']) || !(cur['score_standards'] as unknown[]).length
+    if (needTree) {
+      try {
+        const s4 = await getStepResult('step4', projectId.value)
+        const raw = (s4.result as Record<string, unknown>) || null
+        if (raw && typeof raw.content_json === 'string') {
+          const parsed = JSON.parse(raw.content_json)
+          if (parsed && Array.isArray(parsed.scored_tree)) cur['scored_tree'] = parsed.scored_tree
+          if (parsed && typeof parsed.project_core_content === 'string' && !cur['project_core_content']) cur['project_core_content'] = parsed.project_core_content
+        }
+      } catch { /* ignore */ }
+    }
+    if (needStds) {
+      try {
+        const s5 = await getStepResult('step5', projectId.value)
+        const raw = (s5.result as Record<string, unknown>) || null
+        if (raw && typeof raw.content_json === 'string') {
+          const parsed = JSON.parse(raw.content_json)
+          if (parsed && Array.isArray(parsed.score_standards)) cur['score_standards'] = parsed.score_standards
+          if (parsed && Array.isArray(parsed.scored_tree) && (!Array.isArray(cur['scored_tree']) || !(cur['scored_tree'] as unknown[]).length)) cur['scored_tree'] = parsed.scored_tree
+        }
+      } catch { /* ignore */ }
+    }
+    prevStepResult.value = { ...cur }
+    return cur
+  }
+  const prev = await ensurePrev()
+  const treeOk = Array.isArray(prev['scored_tree']) && (prev['scored_tree'] as unknown[]).length > 0
+  const stdsOk = Array.isArray(prev['score_standards']) && (prev['score_standards'] as unknown[]).length > 0
+  if (!treeOk || !stdsOk) {
+    ElMessage.error(`无法生成：${!treeOk ? '缺少第四步定稿分值（scored_tree）' : ''}${!treeOk && !stdsOk ? '；' : ''}${!stdsOk ? '缺少第五步评分标准（score_standards）' : ''}。请先回到对应步骤完成并保存。`)
+    return
+  }
+  step7EnsureForm()
+  if (!step7Form.value.length) {
+    ElMessage.warning('未识别到三级指标，请确认 step4 / step5 是否已生成。')
+    return
+  }
+  step7Generating.value = true
+  try {
+    const base = buildGenericAgentPayload()
+    const surveySummary = step7SurveySummary.value
+      || ((step7SurveySample.value ? `有效样本量：${step7SurveySample.value}；` : '')
+        + (step7SurveyRate.value ? `综合满意率：${(step7SurveyRate.value * 100).toFixed(2)}%` : '')).trim()
+    const res = await runAgent<Record<string, unknown>>({
+      step_code: 'step7',
+      payload: {
+        ...base,
+        indicator_form: step7Form.value,
+        indicator_inputs: step7Inputs.value,
+        survey_summary: surveySummary,
+        survey_sample_size: step7SurveySample.value || 0,
+        survey_satisfaction_rate: step7SurveyRate.value || 0,
+        review_feedback: step7ReviewFeedback.value,
+      },
+    })
+    const r = (res?.result || {}) as Record<string, unknown>
+    if (Array.isArray(r['indicator_form']) && (r['indicator_form'] as unknown[]).length) {
+      step7Form.value = r['indicator_form'] as Step7IndicatorForm[]
+      step7EnsureForm()
+    }
+    if (Array.isArray(r['analysis_rows'])) step7AnalysisRows.value = r['analysis_rows'] as Step7AnalysisRow[]
+    if (typeof r['block_tables_markdown'] === 'string') step7BlockMd.value = r['block_tables_markdown'] as string
+    if (typeof r['overall_score_table_markdown'] === 'string') step7OverallMd.value = r['overall_score_table_markdown'] as string
+    if (typeof r['total_score'] === 'number') step7TotalScore.value = r['total_score'] as number
+    if (typeof r['total_full_score'] === 'number') step7TotalFull.value = r['total_full_score'] as number
+    if (typeof r['overall_score_rate'] === 'number') step7OverallRate.value = r['overall_score_rate'] as number
+    if (Array.isArray(r['model_comparisons'])) step7Comparisons.value = r['model_comparisons'] as Step7Comparison[]
+    if (typeof r['final_score_sheet_markdown'] === 'string') {
+      step7FinalMd.value = r['final_score_sheet_markdown'] as string
+      editor.value = step7FinalMd.value
+      resultText.value = editor.value
+    } else if (typeof r['analysis_draft_markdown'] === 'string') {
+      editor.value = r['analysis_draft_markdown'] as string
+      resultText.value = editor.value
+    }
+    currentResult.value = r
+    saveStep7DraftState()
+    ElMessage.success('指标分析已生成（草稿仅在短期记忆，未持久化）。')
+  } catch (e: any) {
+    ElMessage.error(`生成失败：${e?.response?.data?.detail || e?.message || e}`)
+  } finally {
+    step7Generating.value = false
+  }
+}
+
+async function reviewStep7Analysis() {
+  if (step7Reviewing.value) return
+  if (!step7ReviewFeedback.value.trim()) {
+    ElMessage.warning('请先填写人工修改意见后再进行软磨润色。')
+    return
+  }
+  step7Reviewing.value = true
+  try {
+    await generateStep7Analysis()
+  } finally {
+    step7Reviewing.value = false
+  }
+}
+
+function step7AdoptComparison(c: Step7Comparison) {
+  if (!c?.draft) return
+  try {
+    // 解析模型 JSON，把它的 analysis 应用到当前 rows
+    const parsed = JSON.parse(c.draft.replace(/^```(?:json)?/, '').replace(/```$/, ''))
+    const items = Array.isArray(parsed?.rows) ? parsed.rows : []
+    const byId: Record<string, any> = {}
+    for (const it of items) { if (it?.id) byId[String(it.id)] = it }
+    step7AnalysisRows.value = step7AnalysisRows.value.map((row) => {
+      const it = byId[row.id]
+      if (!it) return row
+      const userSum = (step7Inputs.value[row.id] || []).reduce((s, p) => s + (Number(p.score) || 0), 0)
+      const obtained = userSum > 0 ? userSum : Number(it.obtained_score || row.obtained_score || 0)
+      const clamped = Math.max(0, Math.min(row.score, Math.round(obtained * 100) / 100))
+      return {
+        ...row,
+        obtained_score: clamped,
+        score_rate: row.score ? clamped / row.score : 0,
+        deduction_reason: String(it.deduction_reason || row.deduction_reason || ''),
+        analysis: String(it.analysis || row.analysis || ''),
+        model_name: c.model_name,
+      }
+    })
+    saveStep7DraftState()
+    // 采用某模型后，"终审定稿成果"也用当前 rows 即时重拼一份，保证 UI 终审区与 rows 同步。
+    try { step7FinalMd.value = buildStep7CombinedMarkdown() } catch { /* ignore */ }
+    ElMessage.success(`已采用 ${c.label || c.model_name} 的分析结果。`)
+  } catch {
+    ElMessage.error('该模型返回内容解析失败，无法直接采用。')
+  }
+}
+
+function buildStep7CombinedMarkdown(): string {
+  const parts: string[] = []
+  const safeName = (projectName.value || '未命名项目').replace(/[\\/:*?"<>|]/g, '_')
+  parts.push(`# 《${safeName}项目绩效评价指标体系得分表》`)
+  parts.push('')
+  parts.push(
+    `<!-- 个性化导出参数：font-family=${step7ExportFontFamily.value}; font-size=${step7ExportFontSize.value}pt; line-height=${step7ExportLineHeight.value} -->`,
+  )
+  parts.push('')
+  parts.push(`> 项目核心：${(prevStepResult.value as any)?.project_core_content || '（暂无）'}`)
+  parts.push(
+    `> 抽样规模：${step7SurveySample.value || 0}；问卷回收率：${((step7SurveyRate.value ?? 0) * 100).toFixed(1)}%；满意度概览：${step7SurveySummary.value || '（无）'}`,
+  )
+  parts.push('')
+  parts.push(`> 总得分：${step7TotalScore.value} / ${step7TotalFull.value}（综合得分率 ${(step7OverallRate.value * 100).toFixed(2)}%）`)
+  parts.push('')
+  if (step7BlockMd.value && step7BlockMd.value.trim()) {
+    parts.push('## 一、四大板块明细（决策 / 过程 / 产出 / 效益）')
+    parts.push('')
+    parts.push(step7BlockMd.value.trim())
+    parts.push('')
+  }
+  if (step7OverallMd.value && step7OverallMd.value.trim()) {
+    parts.push('## 二、总评分表（合并指标层级 + 加权得分）')
+    parts.push('')
+    parts.push(step7OverallMd.value.trim())
+    parts.push('')
+  }
+  if (step7AnalysisRows.value.length) {
+    parts.push('## 三、AI 事实级深度分析（逐三级指标）')
+    parts.push('')
+    for (const row of step7AnalysisRows.value) {
+      parts.push(`### ${row.l1_name} / ${row.l2_name} / ${row.l3_name}（${row.obtained_score}/${row.score}，得分率 ${(row.score_rate * 100).toFixed(1)}%）`)
+      if (row.deduction_reason) parts.push(`- 扣分原因：${row.deduction_reason}`)
+      if (row.analysis) {
+        parts.push('')
+        parts.push(row.analysis)
+      }
+      parts.push('')
+    }
+  }
+  return parts.join('\n')
+}
+
+function exportStep7Document() {
+  if (!step7AnalysisRows.value.length && !step7BlockMd.value && !step7OverallMd.value) {
+    ElMessage.warning('当前没有可导出的指标体系分析，请先生成内容。')
+    return
+  }
+  try {
+    const md = buildStep7CombinedMarkdown()
+    const safeName = (projectName.value || '未命名项目').replace(/[\\/:*?"<>|]/g, '_')
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${safeName}项目绩效评价指标体系得分表.md`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    ElMessage.success(`已导出《${safeName}项目绩效评价指标体系得分表.md》`)
+  } catch (err) {
+    console.error(err)
+    ElMessage.error('导出失败，请重试。')
+  }
+}
+
 function buildStep4AgentPayload() {
   const base = buildGenericAgentPayload()
+  const prev = prevStepResult.value || {}
   return {
     ...base,
-    flat_l2_tasks: step4FlatL2Tasks.value,
-    scoring_mode: step4ScoringMode.value,
-    manual_scores: step4ScoringMode.value === 'manual' ? step4ManualScores.value : {},
+    flat_l2_tasks: step4FlatL2Tasks.value.map((t) => ({
+      level1_name: t.level1_name,
+      level2_name: t.level2_name,
+      target_l3_count: t.target_l3_count ?? 1,
+      l3_section_markdown: t.l3_section_markdown ?? '',
+    })),
+    assign_mode: step4ScoringMode.value === 'ai' ? 'llm' : 'manual',
+    manual_l3_scores: step4ScoringMode.value === 'manual' ? step4ManualScores.value : {},
     total_score: step4TotalScore.value,
+    project_core_content:
+      typeof prev['project_core_content'] === 'string'
+        ? prev['project_core_content']
+        : (typeof prev['final_core_content'] === 'string' ? prev['final_core_content'] : ''),
   }
 }
 
 function buildStep5AgentPayload() {
   const base = buildGenericAgentPayload()
+  const prev = prevStepResult.value || {}
+  const scoredTree = Array.isArray(prev['scored_tree']) ? prev['scored_tree'] : []
   return {
     ...base,
     score_sheet: step5ScoreSheet.value,
+    scored_tree: scoredTree,
+    total_score: typeof prev['total_score'] === 'number' ? prev['total_score'] : step4TotalScore.value,
+    final_indicator_markdown: typeof prev['final_indicator_markdown'] === 'string' ? prev['final_indicator_markdown'] : prevStepContent.value,
+    project_core_content: typeof prev['project_core_content'] === 'string' ? prev['project_core_content'] : '',
     content_text: prevStepContent.value || editor.value,
   }
+}
+
+function buildStep6AgentPayload() {
+  const base = buildGenericAgentPayload()
+  const prev = prevStepResult.value || {}
+  // step6 验收要求 scored_tree（来自 step4） + score_standards（来自 step5）。step5 的 prev 里同时也带着这两份。
+  const scoredTree = Array.isArray(prev['scored_tree']) ? prev['scored_tree'] : []
+  const scoreStandards = Array.isArray(prev['score_standards']) ? prev['score_standards'] : []
+  return {
+    ...base,
+    scored_tree: scoredTree,
+    score_standards: scoreStandards,
+    project_core_content: typeof prev['project_core_content'] === 'string' ? prev['project_core_content'] : '',
+    questionnaire_decision: step6QuestionnaireDecision.value,
+    review_feedback: step6QuestionnaireFeedback.value,
+    content_text: prevStepContent.value || editor.value,
+  }
+}
+
+// ==================== step6 指标拖拽：解析/序列化 ====================
+function step6MdEscape(text: string): string {
+  return String(text || '').replace(/\|/g, '/').replace(/\n/g, '<br/>').replace(/\r/g, '')
+}
+
+function step6ShortRubric(text: string, limit = 36): string {
+  const t = String(text || '').trim().replace(/\n/g, ' ')
+  return t.length <= limit ? t : t.slice(0, limit - 1) + '…'
+}
+
+function step6LocalCompressRubric(rubric: Record<string, string> | undefined, score: number): string {
+  const r = rubric || {}
+  const f = (v: number) => v.toFixed(0)
+  return (
+    `优≥${f(score * 0.9)}分:${step6ShortRubric(r['优秀'] || '')};`
+    + `良${f(score * 0.75)}-${f(score * 0.89)}:${step6ShortRubric(r['良好'] || '')};`
+    + `合${f(score * 0.6)}-${f(score * 0.74)}:${step6ShortRubric(r['合格'] || '')};`
+    + `差≤${f(score * 0.59)}:${step6ShortRubric(r['不合格'] || '')}`
+  )
+}
+
+function nowIsoCN(): string {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19)
+}
+
+function rebuildFrameworkMarkdownFromTree(
+  projectName: string,
+  tree: Step6L1Node[],
+  standards: Array<Record<string, unknown>>,
+  compressedRubrics: Record<string, string>,
+): string {
+  const explanationIndex: Record<string, string> = {}
+  const rubricIndex: Record<string, Record<string, string>> = {}
+  for (const s of standards || []) {
+    const id = String((s as Record<string, unknown>)['id'] || '')
+    if (!id) continue
+    explanationIndex[id] = String((s as Record<string, unknown>)['key_points'] || '')
+    const rb = (s as Record<string, unknown>)['rubric']
+    if (rb && typeof rb === 'object') rubricIndex[id] = rb as Record<string, string>
+  }
+  const lines: string[] = [
+    `# 《${projectName} — 绩效评价指标体系》`,
+    '',
+    `- 生成时间：${nowIsoCN()}`,
+    '',
+    '## 指标体系表',
+    '',
+    '| 一级指标 | 二级指标 | 三级指标 | 分值 | 指标解释 | 评分标准 |',
+    '| --- | --- | --- | --- | --- | --- |',
+  ]
+  let lastL1 = ''
+  let lastL2 = ''
+  for (const l1 of tree) {
+    const l1Score = Number(l1.score) || 0
+    const l1Name = String(l1.name || '')
+    const l1Label = `${l1Name}（${l1Score.toFixed(0)} 分）`
+    for (const l2 of l1.level2 || []) {
+      const l2Score = Number(l2.score) || 0
+      const l2Name = String(l2.name || '')
+      const l2Label = `${l2Name}（${l2Score.toFixed(0)} 分）`
+      const l3List = l2.level3 || []
+      if (!l3List.length) continue
+      for (const l3 of l3List) {
+        const rowId = String(l3.id || '')
+        const l3Name = String(l3.name || '')
+        const l3Score = Number(l3.score) || 0
+        const explanation = explanationIndex[rowId] || String(l3.key_points || '')
+        const rubricDict = rubricIndex[rowId] || l3.rubric || {}
+        const rubricText = compressedRubrics[rowId]
+          ? compressedRubrics[rowId]
+          : step6LocalCompressRubric(rubricDict, l3Score)
+        const l1Cell = l1Name !== lastL1 ? l1Label : ''
+        const l2Cell = (l2Name !== lastL2 || l1Name !== lastL1) ? l2Label : ''
+        lastL1 = l1Name
+        lastL2 = l2Name
+        lines.push(
+          `| ${step6MdEscape(l1Cell)} | ${step6MdEscape(l2Cell)} | ${step6MdEscape(l3Name)} | ${l3Score.toFixed(0)} | ${step6MdEscape(explanation || '（暂无解释）')} | ${step6MdEscape(rubricText)} |`
+        )
+      }
+    }
+  }
+  lines.push('')
+  return lines.join('\n')
+}
+
+function parseScoredTreeIntoStep6Tree() {
+  const raw = currentResult.value?.['scored_tree']
+  if (!Array.isArray(raw)) {
+    step6Tree.value = []
+    return
+  }
+  // 深拷贝，避免拖拽直接改到原 currentResult，确认提交前都只在拷贝里编辑
+  const cloned: Step6L1Node[] = []
+  for (const l1 of raw as any[]) {
+    const level2: Step6L2Node[] = []
+    for (const l2 of (l1?.level2 || []) as any[]) {
+      const level3: Step6L3Node[] = []
+      for (const l3 of (l2?.level3 || []) as any[]) {
+        level3.push({
+          id: String(l3?.id ?? ''),
+          name: String(l3?.name ?? ''),
+          score: Number(l3?.score) || 0,
+          key_points: typeof l3?.key_points === 'string' ? l3.key_points : '',
+          rubric: l3?.rubric && typeof l3.rubric === 'object' ? { ...l3.rubric } : {},
+        })
+      }
+      level2.push({
+        name: String(l2?.name ?? ''),
+        score: Number(l2?.score) || 0,
+        level3,
+      })
+    }
+    cloned.push({
+      name: String(l1?.name ?? ''),
+      score: Number(l1?.score) || 0,
+      level2,
+    })
+  }
+  step6Tree.value = cloned
+  step6TreeDirty.value = false
+}
+
+function applyStep6TreeBackToResult() {
+  if (!currentResult.value || !Array.isArray(step6Tree.value) || !step6Tree.value.length) return
+  const standards = Array.isArray(currentResult.value['score_standards'])
+    ? (currentResult.value['score_standards'] as Array<Record<string, unknown>>)
+    : []
+  const compressed = (currentResult.value['compressed_rubrics'] && typeof currentResult.value['compressed_rubrics'] === 'object')
+    ? (currentResult.value['compressed_rubrics'] as Record<string, string>)
+    : {}
+  const md = rebuildFrameworkMarkdownFromTree(
+    projectName.value || '未命名项目',
+    step6Tree.value,
+    standards,
+    compressed,
+  )
+  // 写回纯数据 scored_tree 供 step7+ 复用
+  const newTree = step6Tree.value.map((l1) => ({
+    name: l1.name,
+    score: l1.score,
+    level2: l1.level2.map((l2) => ({
+      name: l2.name,
+      score: l2.score,
+      level3: l2.level3.map((l3) => ({
+        id: l3.id,
+        name: l3.name,
+        score: l3.score,
+        key_points: l3.key_points || '',
+        rubric: l3.rubric || {},
+      })),
+    })),
+  }))
+  currentResult.value = {
+    ...currentResult.value,
+    scored_tree: newTree,
+    final_indicator_framework_markdown: md,
+  }
+  editor.value = md
+  resultText.value = JSON.stringify(currentResult.value, null, 2)
+  if (projectId.value) {
+    saveGenericStepDraft(stepCodeOf(), {
+      project_id: projectId.value,
+      thread_id: `step6:${projectId.value}`,
+      content_text: editor.value,
+      content_json: resultText.value,
+      current_result: currentResult.value,
+    })
+  }
+}
+
+function destroyStep6Sortables() {
+  while (step6SortableInstances.length) {
+    const inst = step6SortableInstances.pop()
+    try { inst?.destroy() } catch { /* noop */ }
+  }
+}
+
+function mountStep6Sortables() {
+  destroyStep6Sortables()
+  if (!step6Tree.value.length) return
+  const onEnd = () => {
+    step6TreeDirty.value = true
+    applyStep6TreeBackToResult()
+  }
+  // L1 之间允许整组拖动
+  if (step6L1ListRef.value) {
+    step6SortableInstances.push(new Sortable(step6L1ListRef.value, {
+      group: 'step6-l1',
+      animation: 150,
+      handle: '.step6-drag-handle',
+      onEnd: (evt) => {
+        if (evt.oldIndex === evt.newIndex) return
+        const arr = step6Tree.value
+        const [moved] = arr.splice(evt.oldIndex!, 1)
+        arr.splice(evt.newIndex!, 0, moved)
+        onEnd()
+      },
+    }))
+  }
+  // L2 仅在同一 L1 内允许重排
+  step6Tree.value.forEach((l1, l1Idx) => {
+    const key = `l2-${l1Idx}`
+    const el = step6L2ListRefs.value[key]
+    if (!el) return
+    step6SortableInstances.push(new Sortable(el, {
+      group: { name: `step6-l2-${l1Idx}`, pull: false, put: false },
+      animation: 150,
+      handle: '.step6-drag-handle',
+      onEnd: (evt) => {
+        if (evt.oldIndex === evt.newIndex) return
+        const arr = l1.level2
+        const [moved] = arr.splice(evt.oldIndex!, 1)
+        arr.splice(evt.newIndex!, 0, moved)
+        onEnd()
+      },
+    }))
+    // L3 仅在同一 L2 内允许重排
+    l1.level2.forEach((l2, l2Idx) => {
+      const key3 = `l3-${l1Idx}-${l2Idx}`
+      const el3 = step6L3ListRefs.value[key3]
+      if (!el3) return
+      step6SortableInstances.push(new Sortable(el3, {
+        group: { name: `step6-l3-${l1Idx}-${l2Idx}`, pull: false, put: false },
+        animation: 150,
+        handle: '.step6-drag-handle',
+        onEnd: (evt) => {
+          if (evt.oldIndex === evt.newIndex) return
+          const arr = l2.level3
+          const [moved] = arr.splice(evt.oldIndex!, 1)
+          arr.splice(evt.newIndex!, 0, moved)
+          onEnd()
+        },
+      }))
+    })
+  })
+}
+
+watch(
+  () => [stepId.value, currentResult.value?.['scored_tree']],
+  async () => {
+    if (stepId.value === 6) {
+      parseScoredTreeIntoStep6Tree()
+      await nextTick()
+      mountStep6Sortables()
+    } else {
+      destroyStep6Sortables()
+      step6Tree.value = []
+    }
+    if (stepId.value === 7) {
+      // 优先 localStorage 草稿，没有再按上游构建 form
+      if (!loadStep7DraftState()) {
+        step7Form.value = step7BuildFormFromUpstream()
+        step7AnalysisRows.value = []
+        step7BlockMd.value = ''
+        step7OverallMd.value = ''
+        step7FinalMd.value = ''
+        step7TotalScore.value = 0
+        step7TotalFull.value = 0
+        step7OverallRate.value = 0
+        step7Comparisons.value = []
+      }
+      step7EnsureForm()
+      // 进入 step7 时若 prev 还没回源完成（首次进入或刷新），form 会是空的，
+      // 这里自动走一次 bootstrap，去 step4/step5 直接拉数据补齐，避免空状态死锁。
+      if (!step7Form.value.length && projectId.value) {
+        await step7BootstrapForm()
+      }
+    }
+  },
+  { immediate: true, deep: false },
+)
+
+// step7 表单 / inputs / 反馈 / 问卷数据变化 → 自动写入 localStorage 短期记忆（CLAUDE.md 双层缓存兜底）
+watch(
+  () => [stepId.value, step7Inputs.value, step7AnalysisRows.value, step7ReviewFeedback.value,
+         step7SurveySample.value, step7SurveyRate.value, step7SurveySummary.value,
+         step7ExportFontFamily.value, step7ExportFontSize.value, step7ExportLineHeight.value],
+  () => {
+    if (stepId.value === 7 && projectId.value) saveStep7DraftState()
+  },
+  { deep: true },
+)
+
+// prevStepResult 异步回源完成后（首次进入 step7 时上游 step4/step5 数据可能还在路上），
+// 若此时 step7Form 仍为空，立即按上游构造一遍，避免用户看到永远的空状态。
+watch(
+  () => prevStepResult.value,
+  () => {
+    if (stepId.value !== 7) return
+    if (step7Form.value.length) return
+    const built = step7BuildFormFromUpstream()
+    if (built.length) {
+      step7Form.value = built
+      step7EnsureForm()
+    }
+  },
+  { deep: true },
+)
+
+function buildStep6QuestionnaireMarkdown(): string {
+  if (!step6QuestionnaireItems.value.length) return step6QuestionnaireDraft.value || ''
+  const lines: string[] = ['# 里克特 5 级满意度问卷']
+  step6QuestionnaireItems.value.forEach((q, idx) => {
+    lines.push('')
+    lines.push(`## ${idx + 1}. ${q.question}`)
+    if (q.indicator_name) lines.push(`> 关联指标：${q.indicator_name}`)
+    q.options.forEach((opt) => lines.push(`- [ ] ${opt}`))
+  })
+  return lines.join('\n')
+}
+
+function buildStep6CombinedMarkdown(): string {
+  const framework = (currentResult.value
+    && typeof (currentResult.value as Record<string, unknown>)['final_indicator_framework_markdown'] === 'string'
+    ? ((currentResult.value as Record<string, unknown>)['final_indicator_framework_markdown'] as string)
+    : '') || editor.value || ''
+  const questionnaire = buildStep6QuestionnaireMarkdown()
+  const blocks: string[] = []
+  if (framework.trim()) blocks.push('# 绩效评价指标体系（现场评分表）', '', framework.trim())
+  if (questionnaire.trim()) blocks.push('', '---', '', questionnaire.trim())
+  return blocks.join('\n')
+}
+
+async function copyToClipboard(text: string) {
+  if (!text) return
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.left = '-9999px'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.warning('复制失败，请手动选中文本')
+  }
+}
+
+function downloadStep6Markdown() {
+  const md = buildStep6CombinedMarkdown()
+  if (!md.trim()) {
+    ElMessage.warning('当前没有可导出的内容，请先生成指标体系或问卷。')
+    return
+  }
+  step6Exporting.value = true
+  try {
+    const safeName = (projectName.value || '未命名项目').replace(/[\\/:*?"<>|]/g, '_')
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${safeName}_step6_指标体系与问卷.md`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    ElMessage.success('已下载 Markdown')
+  } finally {
+    step6Exporting.value = false
+  }
+}
+
+function step6ResponsesKey(pid: string) {
+  return `ef_q_responses:${pid}`
+}
+
+function loadStep6Responses() {
+  if (!projectId.value) return
+  try {
+    const raw = localStorage.getItem(step6ResponsesKey(projectId.value))
+    if (!raw) {
+      step6ResponseHistory.value = []
+      return
+    }
+    const arr = JSON.parse(raw)
+    step6ResponseHistory.value = Array.isArray(arr) ? (arr as Step6ResponseRecord[]) : []
+  } catch {
+    step6ResponseHistory.value = []
+  }
+}
+
+function submitStep6Response() {
+  if (!projectId.value) return
+  if (!step6QuestionnaireItems.value.length) {
+    ElMessage.warning('当前没有可提交的问卷题目。')
+    return
+  }
+  const unanswered = step6QuestionnaireItems.value.filter((q) => !step6Answers.value[q.id])
+  if (unanswered.length) {
+    ElMessage.warning(`还有 ${unanswered.length} 题未作答`)
+    return
+  }
+  const record: Step6ResponseRecord = {
+    version: typeof (currentResult.value as Record<string, unknown> | null)?.['version'] === 'number'
+      ? ((currentResult.value as Record<string, unknown>)['version'] as number)
+      : 0,
+    respondent_role: step6RespondentRole.value,
+    answers: { ...step6Answers.value },
+    submitted_at: new Date().toISOString(),
+  }
+  loadStep6Responses()
+  step6ResponseHistory.value = [...step6ResponseHistory.value, record]
+  try {
+    localStorage.setItem(
+      step6ResponsesKey(projectId.value),
+      JSON.stringify(step6ResponseHistory.value),
+    )
+    ElMessage.success(`已提交 1 份问卷（角色：${record.respondent_role}）`)
+    step6Answers.value = {}
+  } catch (e) {
+    ElMessage.error('保存到本地失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+function clearStep6Responses() {
+  if (!projectId.value) return
+  localStorage.removeItem(step6ResponsesKey(projectId.value))
+  step6ResponseHistory.value = []
+  ElMessage.success('已清空本地问卷答案')
 }
 
 function buildStep9AgentPayload() {
@@ -1894,6 +3629,7 @@ function buildAgentPayloadByStep() {
   if (stepId.value === 3) return buildStep3AgentPayload()
   if (stepId.value === 4) return buildStep4AgentPayload()
   if (stepId.value === 5) return buildStep5AgentPayload()
+  if (stepId.value === 6) return buildStep6AgentPayload()
   if (stepId.value === 9) return buildStep9AgentPayload()
   if (stepId.value === 14) return buildStep14AgentPayload()
   if (stepId.value >= 6 && stepId.value <= 13) {
@@ -2038,11 +3774,28 @@ function syncStep3FromResult(result: Record<string, unknown> | null) {
 
   const tasks = parseStep3FlatL2Tasks(result)
   if (tasks.length) {
-    step3SkeletonTasks.value = tasks
+    if (step3SkeletonTasks.value.length === 0) {
+      step3SkeletonTasks.value = tasks
+    } else {
+      // Merge: preserve existing l3_section_markdown if backend returns empty for that task.
+      const merged = tasks.map((incoming) => {
+        const existing = step3SkeletonTasks.value.find(
+          (t) => t.level1_name === incoming.level1_name && t.level2_name === incoming.level2_name,
+        )
+        if (existing && existing.l3_section_markdown && !incoming.l3_section_markdown) {
+          return { ...incoming, l3_section_markdown: existing.l3_section_markdown }
+        }
+        return incoming
+      })
+      step3SkeletonTasks.value = merged
+    }
   }
 
   if (typeof result.active_l2_index === 'number' && Number.isFinite(result.active_l2_index)) {
-    step3ActiveL2Index.value = Math.max(0, Math.min(step3SkeletonTasks.value.length - 1, result.active_l2_index as number))
+    // Only apply backend's index hint during initial load (no tasks yet), not during active generation.
+    if (!step3SkeletonTasks.value.length) {
+      step3ActiveL2Index.value = Math.max(0, Math.min(tasks.length - 1, result.active_l2_index as number))
+    }
   }
 
   const draft = result.l3_active_draft
@@ -2076,7 +3829,16 @@ function syncStep3FromResult(result: Record<string, unknown> | null) {
   } else if (status === 'l3_draft_ready' || status === 'l3_refined' || status === 'l3_level_saved') {
     step3SkeletonPhase.value = 'generating_l3'
   } else if (status === 'skeleton_ready' || tasks.length > 0) {
-    step3SkeletonPhase.value = tasks.length && tasks.every((t) => t.l3_section_markdown) ? 'completed' : (tasks.some((t) => t.l3_section_markdown) ? 'generating_l3' : 'skeleton')
+    const allDone = tasks.length > 0 && tasks.every((t) => t.l3_section_markdown)
+    const someDone = tasks.some((t) => t.l3_section_markdown)
+    const hasDraft = Boolean(step3L3Draft.value)
+    if (allDone) {
+      step3SkeletonPhase.value = 'completed'
+    } else if (someDone || hasDraft || step3SkeletonPhase.value === 'generating_l3') {
+      step3SkeletonPhase.value = 'generating_l3'
+    } else {
+      step3SkeletonPhase.value = 'skeleton'
+    }
   }
 
   currentResult.value = result
@@ -2090,7 +3852,7 @@ function applyStep3Result(res: AgentRunResponse) {
 }
 
 async function runStep3BuildSkeleton() {
-  if (!step3State.value?.final_core_content && !step3State.value?.content_text && !currentResult.value?.final_core_content) {
+  if (!step3HasStep2Core.value) {
     ElMessage.warning('请先确保 Step2 已定稿并保存核心内容')
     return
   }
@@ -2127,6 +3889,10 @@ async function runStep3BuildSkeleton() {
       },
     })
     applyStep3Result(res)
+    if (step3SkeletonTasks.value.length > 0 && step3SkeletonPhase.value !== 'completed') {
+      step3SkeletonPhase.value = 'generating_l3'
+    }
+    saveStep3DraftState()
     ElMessage.success('指标体系骨架已构建，正在逐个生成三级指标，请审阅当前结果')
   } catch (e) {
     error.value = e instanceof Error ? e.message : '构建骨架失败'
@@ -2137,8 +3903,10 @@ async function runStep3BuildSkeleton() {
 }
 
 async function runStep3Continue() {
+  step3SkeletonPhase.value = 'generating_l3'
   loading.value = true
   error.value = ''
+  const targetIndex = step3ActiveL2Index.value
   const runId = `step3:${projectId.value}:${Date.now()}:${Math.random().toString(16).slice(2)}`
   activeRunId.value = runId
   try {
@@ -2170,16 +3938,34 @@ async function runStep3Continue() {
       },
     })
     applyStep3Result(res)
+    // Restore the user's selected tab — backend may return a different active_l2_index.
+    if (targetIndex >= 0 && targetIndex < step3SkeletonTasks.value.length) {
+      step3ActiveL2Index.value = targetIndex
+      // Ensure the draft content is associated with the correct task.
+      const returnedDraft = step3L3Draft.value
+      if (returnedDraft && returnedDraft.trim()) {
+        step3SkeletonTasks.value[targetIndex] = {
+          ...step3SkeletonTasks.value[targetIndex],
+          l3_section_markdown: returnedDraft,
+        }
+      }
+      // Re-read draft from the target task to keep display in sync.
+      step3L3Draft.value = step3SkeletonTasks.value[targetIndex].l3_section_markdown || returnedDraft || ''
+    }
+    if (step3SkeletonPhase.value !== 'completed') {
+      step3SkeletonPhase.value = 'generating_l3'
+    }
     if (step3L3ReviewMode.value === 'approve') {
       step3L3Feedback.value = ''
       if (step3SkeletonPhase.value === 'generating_l3') {
-        ElMessage.success('当前三级指标已批准，进入下一个二级指标')
+        ElMessage.success(`「${step3SkeletonTasks.value[targetIndex]?.level2_name || ''}」三级指标已生成`)
       } else if (step3SkeletonPhase.value === 'completed') {
         ElMessage.success('全部二级指标已处理完毕，指标体系定稿完成！')
       }
     } else {
       ElMessage.success('已根据修改意见重新生成，请审阅')
     }
+    saveStep3DraftState()
   } catch (e) {
     error.value = e instanceof Error ? e.message : '操作失败'
   } finally {
@@ -2304,14 +4090,27 @@ function applyStep3Template() {
   }
 }
 
-function selectStep3L2(index: number) {
-  if (index >= 0 && index < step3SkeletonTasks.value.length) {
-    step3ActiveL2Index.value = index
-    // Show the saved L3 content for this L2
-    const task = step3SkeletonTasks.value[index]
-    step3L3Draft.value = task.l3_section_markdown || ''
-    step3L3Comparisons.value = []
+function syncCurrentL3DraftToTask() {
+  const idx = step3ActiveL2Index.value
+  if (idx < 0 || idx >= step3SkeletonTasks.value.length) return
+  const draft = (step3L3Draft.value || '').trim()
+  if (!draft) return
+  step3SkeletonTasks.value[idx] = {
+    ...step3SkeletonTasks.value[idx],
+    l3_section_markdown: step3L3Draft.value,
   }
+}
+
+function selectStep3L2(index: number) {
+  if (index < 0 || index >= step3SkeletonTasks.value.length) return
+  if (index === step3ActiveL2Index.value) return
+  syncCurrentL3DraftToTask()
+  step3ActiveL2Index.value = index
+  const task = step3SkeletonTasks.value[index]
+  step3L3Draft.value = task.l3_section_markdown || ''
+  step3L3Comparisons.value = []
+  step3L3Feedback.value = ''
+  saveStep3DraftState()
 }
 
 function applyL3Comparison(index: number) {
@@ -2340,6 +4139,7 @@ function approveL3AndNext() {
     step3SkeletonPhase.value = 'completed'
     ElMessage.success('全部二级指标已完成！可点击"完成 Step3 收尾并保存"定稿')
   }
+  saveStep3DraftState()
 }
 
 function manualSaveCurrentL3() {
@@ -2348,6 +4148,7 @@ function manualSaveCurrentL3() {
     ...step3SkeletonTasks.value[step3ActiveL2Index.value],
     l3_section_markdown: step3L3Draft.value,
   }
+  saveStep3DraftState()
   ElMessage.success('当前三级指标已手动保存')
 }
 
@@ -2457,6 +4258,48 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
   error.value = ''
   const runId = `${stepCodeOf()}:${projectId.value}:${Date.now()}:${Math.random().toString(16).slice(2)}`
   activeRunId.value = runId
+  // step4 的图带 interrupt_after，旧 thread 会让图从断点恢复并复用旧 scored_tree（旧观测点/旧分值）。
+  // 每次生成前先丢弃 MemorySaver 检查点，强制图从 START 重跑，确保用上最新模板与考核要点。
+  if (stepId.value === 4 && projectId.value) {
+    try {
+      await clearThreadState({
+        step_code: 'step4',
+        thread_id: `step4:${projectId.value}`,
+        project_id: projectId.value,
+        role: 'client',
+      })
+    } catch (e) {
+      console.warn('[step4] clear thread before generate failed', e)
+    }
+  }
+  // step5 同理：MemorySaver 中残留的旧 score_standards（旧 l3_name / 旧分值 / 缺 key_points）
+  // 会让"重新生成"形同虚设，强制从 START 重跑以基于最新 scored_tree 构造评分标准。
+  if (stepId.value === 5 && projectId.value) {
+    try {
+      await clearThreadState({
+        step_code: 'step5',
+        thread_id: `step5:${projectId.value}`,
+        project_id: projectId.value,
+        role: 'client',
+      })
+    } catch (e) {
+      console.warn('[step5] clear thread before generate failed', e)
+    }
+  }
+  // step6 同理：旧 thread 会带回上一次的 questionnaire_items / final_indicator_framework_markdown，
+  // 导致用户切换"是否需要问卷"或修改 step3~5 后再来 step6 拿到的还是旧体系/旧问卷。
+  if (stepId.value === 6 && projectId.value) {
+    try {
+      await clearThreadState({
+        step_code: 'step6',
+        thread_id: `step6:${projectId.value}`,
+        project_id: projectId.value,
+        role: 'client',
+      })
+    } catch (e) {
+      console.warn('[step6] clear thread before generate failed', e)
+    }
+  }
   try {
     const payload = buildAgentPayloadByStep()
     const selectedNames = options.models?.length ? new Set(options.models) : null
@@ -2526,6 +4369,15 @@ async function runStep(prompt = '', options: { models?: string[] } = {}) {
         project_files: inputProjectFiles.value,
         updated_at: new Date().toISOString(),
       })
+    } else if (stepId.value >= 4) {
+      // step4-step14 通用 localStorage 双保险（step1/2/3 已有专用 draft state）
+      saveGenericStepDraft(stepCodeOf(), {
+        project_id: projectId.value,
+        thread_id: `${stepCodeOf()}:${projectId.value}`,
+        content_text: editor.value,
+        content_json: resultText.value,
+        current_result: currentResult.value,
+      })
     }
     await loadWorkflowStatus()
   } catch (e) {
@@ -2557,6 +4409,15 @@ watch(editor, (val) => {
     step2DraftDirty.value = true
     step2WriteBackToCheckpointer()
   }
+  if (stepId.value >= 4 && !isEditorEmpty(val)) {
+    saveGenericStepDraft(stepCodeOf(), {
+      project_id: projectId.value,
+      thread_id: `${stepCodeOf()}:${projectId.value}`,
+      content_text: val,
+      content_json: resultText.value,
+      current_result: currentResult.value,
+    })
+  }
 })
 
 onMounted(() => {
@@ -2568,6 +4429,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', onBeforeUnloadGuard)
   if (step2WriteBackTimer) clearTimeout(step2WriteBackTimer)
+  destroyStep6Sortables()
 })
 
 function onBeforeUnloadGuard(e: BeforeUnloadEvent) {
@@ -2617,15 +4479,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
       <template #actions>
         <el-button @click="router.push(`/app/projects/${projectId}/overview`)">回总览</el-button>
         <el-button @click="historyOpen = true">历史</el-button>
-        <el-button v-if="stepId === 1" @click="openUploadDialog('documents')">资料上传窗口</el-button>
-        <el-button v-if="stepId === 2" type="primary" :loading="loading" :disabled="!step2HasFiles" @click="runStep('')">一键生成 Step2</el-button>
-        <el-button v-if="stepId === 2" type="warning" :loading="step2ExportSaving" @click="openStep2ExportDialog">成果导出</el-button>
-        <el-button v-if="stepId === 3 && step3SkeletonPhase === 'config'" type="primary" :loading="loading" @click="runStep3BuildSkeleton">构建指标体系骨架</el-button>
-        <el-button v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3'" type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
-        <el-button v-if="stepId === 3" type="success" :loading="saving" @click="finalizeStep3Workflow">完成 Step3 收尾并保存</el-button>
-        <el-button v-if="stepId === 14" type="warning" :loading="step14ExportSaving" :disabled="isEditorEmpty()" @click="openStep14ExportDialog">导出评价报告</el-button>
         <el-button :loading="saving" type="success" @click="saveCurrentStep">保存最终版本</el-button>
-        <el-button v-if="stepId === 3" @click="loadResult">刷新 Step3 状态</el-button>
         <el-button type="primary" @click="chatOpen = true">AI 对话</el-button>
       </template>
     </PageHeader>
@@ -3146,7 +5000,7 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           <!-- Step3: 配置阶段 -->
           <el-card id="sec-step3-config" v-if="stepId === 3 && step3SkeletonPhase === 'config'" shadow="never">
             <template #header>Step3 · 指标体系配置</template>
-            <el-alert v-if="!step3State?.core_basis_digest && !step3State?.project_core_content" type="warning" :closable="false" show-icon title="当前尚未读取到 Step2 核心内容，请先确保 Step2 已定稿并保存。" />
+            <el-alert v-if="!step3HasStep2Core" type="warning" :closable="false" show-icon title="当前尚未读取到 Step2 核心内容，请先确保 Step2 已定稿并保存。" />
             <el-alert v-else type="success" :closable="false" show-icon class="mb" title="已读取 Step2 核心内容，下方配置完成后即可构建指标体系。" />
             <el-form label-width="120px">
               <el-form-item label="体系类型">
@@ -3236,14 +5090,14 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </el-form>
             <el-alert type="info" :closable="false" show-icon class="mb" title="点击下方按钮，系统将根据配置构建指标体系骨架，并逐个二级指标生成三级指标与解释。" />
             <div class="upload-toolbar">
-              <el-button type="primary" size="large" :loading="loading" @click="runStep3BuildSkeleton" :disabled="!step3State?.core_basis_digest && !step3State?.project_core_content && !step3State?.final_core_content">
+              <el-button type="primary" size="large" :loading="loading" @click="runStep3BuildSkeleton" :disabled="!step3HasStep2Core">
                 构建指标体系骨架
               </el-button>
             </div>
           </el-card>
 
           <!-- Step3: 骨架编辑 & L3 生成阶段 -->
-          <el-card id="sec-step3-skeleton" v-if="stepId === 3 && (step3SkeletonPhase === 'skeleton' || step3SkeletonPhase === 'generating_l3')" shadow="never">
+          <el-card id="sec-step3-skeleton" v-if="stepId === 3 && step3SkeletonPhase !== 'config'" shadow="never">
             <template #header>Step3 · 指标体系骨架管理</template>
             <el-alert type="success" :closable="false" show-icon class="mb" title="骨架已就绪，可增删改一级/二级指标，调整三级数量，然后逐个生成三级指标与解释。" />
             <el-alert
@@ -3301,115 +5155,134 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
           </el-card>
 
           <!-- Step3: 逐个二级指标生成三级指标 -->
-          <el-card id="sec-step3-l3" v-if="stepId === 3 && step3SkeletonPhase === 'generating_l3' && step3ActiveL2Task" shadow="never">
+          <el-card id="sec-step3-l3" v-if="stepId === 3 && step3SkeletonPhase !== 'config' && step3SkeletonTasks.length" shadow="never">
             <template #header>
-              Step3 · 三级指标生成 —
-              当前：{{ step3ActiveL2Task.level1_name }} → {{ step3ActiveL2Task.level2_name }}
-              （第 {{ step3ActiveL2Index + 1 }}/{{ step3SkeletonTasks.length }} 个）
+              Step3 · 三级指标生成（共 {{ step3SkeletonTasks.length }} 个二级指标）
             </template>
             <el-progress :percentage="step3L2Progress.percent" :text-inside="true" :stroke-width="20" style="margin-bottom: 12px;" />
-            <div class="step3-summary-grid">
-              <div class="step3-summary-card">
-                <div class="step3-summary-title">当前一级指标</div>
-                <div class="step3-summary-value">{{ step3ActiveL2Task.level1_name }}</div>
-              </div>
-              <div class="step3-summary-card">
-                <div class="step3-summary-title">当前二级指标</div>
-                <div class="step3-summary-value">{{ step3ActiveL2Task.level2_name }}</div>
-              </div>
-              <div class="step3-summary-card">
-                <div class="step3-summary-title">需要三级指标数</div>
-                <div class="step3-summary-value">{{ step3ActiveL2Task.target_l3_count }} 个</div>
-              </div>
-              <div class="step3-summary-card">
-                <div class="step3-summary-title">进度</div>
-                <div class="step3-summary-value">{{ step3ActiveL2Index + 1 }} / {{ step3SkeletonTasks.length }}</div>
-              </div>
-            </div>
-
-            <!-- LLM 生成按钮 -->
-            <el-alert type="info" :closable="false" show-icon class="mb" title="点击下方按钮，由大模型根据第二步核心内容生成本二级指标下的三级指标与指标解释。支持多模型并行对比。" />
             <el-alert
               v-if="step3AllL2Completed"
               type="success"
               :closable="false"
               show-icon
               class="mb"
-              title="全部二级指标的三级内容已就绪，可点击「保存并完成全部三级指标」，或使用顶部「完成 Step3 收尾并保存」定稿。"
+              title="全部二级指标的三级内容已就绪，可点击「完成 Step3 收尾并保存」定稿。"
             />
-            <div class="upload-toolbar">
-              <el-button type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
-              <el-button @click="chatOpen = true">通过 AI 对话生成</el-button>
-            </div>
 
-            <!-- 多模型对比 -->
-            <el-card v-if="step3L3Comparisons.length > 1" shadow="never" style="margin-top: 12px; background: var(--el-fill-color-lighter);">
-              <template #header>
-                <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                  <span>多模型对比（共 {{ step3L3Comparisons.length }} 个模型）</span>
-                  <el-radio-group v-model="step3L3CompareViewMode" size="small">
-                    <el-radio-button value="raw">原文</el-radio-button>
-                    <el-radio-button value="preview">看板</el-radio-button>
-                  </el-radio-group>
-                </div>
-              </template>
-              <div class="step2-compare-layout">
-                <div class="step2-compare-list">
-                  <div
-                    v-for="(item, idx) in step3L3Comparisons"
-                    :key="`l3-cmp-${idx}`"
-                    class="step2-compare-card"
-                    :class="{ active: idx === step3L3ActiveCompareIndex }"
-                    style="cursor: pointer;"
-                    @click="step3L3ActiveCompareIndex = idx"
-                  >
-                    <div class="step2-compare-title">{{ item.label || item.model_name }}</div>
-                    <el-tag v-if="item.error" type="danger" size="small">调用失败</el-tag>
-                    <el-tag v-else type="success" size="small">{{ (item.draft || '').length }} 字</el-tag>
-                  </div>
-                </div>
-                <div class="step2-compare-detail">
-                  <div v-if="step3L3Comparisons[step3L3ActiveCompareIndex]">
-                    <pre v-if="step3L3CompareViewMode === 'raw'" class="result">{{ step3L3Comparisons[step3L3ActiveCompareIndex].draft || (step3L3Comparisons[step3L3ActiveCompareIndex].error ? `调用失败：${step3L3Comparisons[step3L3ActiveCompareIndex].error}` : '空响应') }}</pre>
-                    <MarkdownDashboard v-else :source="step3L3Comparisons[step3L3ActiveCompareIndex].draft || ''" />
-                    <div class="upload-toolbar">
-                      <el-button type="primary" :disabled="!step3L3Comparisons[step3L3ActiveCompareIndex].draft" @click="applyL3Comparison(step3L3ActiveCompareIndex)">导入为当前草案</el-button>
+            <el-tabs v-model="step3ActiveL2Tab" type="card" @tab-change="onStep3TabChange">
+              <el-tab-pane
+                v-for="(task, idx) in step3SkeletonTasks"
+                :key="`l3-tab-${idx}`"
+                :name="String(idx)"
+              >
+                <template #label>
+                  <span :style="{ color: task.l3_section_markdown ? 'var(--el-color-success)' : undefined }">
+                    {{ task.level1_name }} → {{ task.level2_name }}
+                    {{ task.l3_section_markdown ? ' ✓' : '' }}
+                  </span>
+                </template>
+
+                <div v-if="idx === step3ActiveL2Index">
+                  <div class="step3-summary-grid" style="margin-bottom: 12px;">
+                    <div class="step3-summary-card">
+                      <div class="step3-summary-title">一级指标</div>
+                      <div class="step3-summary-value">{{ task.level1_name }}</div>
+                    </div>
+                    <div class="step3-summary-card">
+                      <div class="step3-summary-title">二级指标</div>
+                      <div class="step3-summary-value">{{ task.level2_name }}</div>
+                    </div>
+                    <div class="step3-summary-card">
+                      <div class="step3-summary-title">需要三级指标数</div>
+                      <div class="step3-summary-value">{{ task.target_l3_count }} 个</div>
+                    </div>
+                    <div class="step3-summary-card">
+                      <div class="step3-summary-title">状态</div>
+                      <div class="step3-summary-value">{{ task.l3_section_markdown ? '已完成' : '待生成' }}</div>
                     </div>
                   </div>
-                </div>
-              </div>
-            </el-card>
 
-            <!-- 当前三级指标草案 -->
-            <el-form label-width="110px" style="margin-top: 12px;">
-              <el-form-item label="三级指标草案">
-                <div style="width: 100%;">
-                  <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
-                    <el-radio-group v-model="step3L3ViewMode" size="small">
-                      <el-radio-button value="edit">编辑</el-radio-button>
-                      <el-radio-button value="preview">看板</el-radio-button>
-                    </el-radio-group>
+                  <!-- 生成按钮 -->
+                  <div class="upload-toolbar" style="margin-bottom: 12px;">
+                    <el-button type="primary" :loading="loading" :disabled="!step3CanGenerateL3" @click="step3L3ReviewMode = 'approve'; runStep3Continue()">生成三级指标</el-button>
+                    <el-button @click="chatOpen = true">通过 AI 对话生成</el-button>
                   </div>
-                  <el-input v-if="step3L3ViewMode === 'edit'" v-model="step3L3Draft" type="textarea" :rows="12" placeholder="三级指标草案将显示在这里，支持直接编辑" />
-                  <MarkdownDashboard v-else :source="step3L3Draft || ''" />
-                </div>
-              </el-form-item>
-              <el-form-item label="修改意见">
-                <el-input v-model="step3L3Feedback" type="textarea" :rows="3" placeholder="输入修改意见，让大模型根据意见重新生成（可选）" />
-              </el-form-item>
-            </el-form>
 
-            <!-- 操作按钮 -->
-            <div class="upload-toolbar">
-              <el-button type="primary" :loading="loading" @click="manualSaveCurrentL3">保存当前草案（手动）</el-button>
-              <el-button type="success" :loading="loading" @click="approveL3AndNext">
-                {{ step3ActiveL2Index + 1 < step3SkeletonTasks.length ? '保存并进入下一个二级指标' : '保存并完成全部三级指标' }}
-              </el-button>
-              <el-button v-if="step3L3Feedback.trim()" type="warning" :loading="loading" @click="step3L3ReviewMode = 'modify'; runStep3Continue()">
-                提交修改意见，让 AI 重新生成
-              </el-button>
-              <el-button @click="chatOpen = true">通过对话修改</el-button>
-            </div>
+                  <!-- 多模型对比 -->
+                  <el-card v-if="step3L3Comparisons.length > 1" shadow="never" style="margin-bottom: 12px; background: var(--el-fill-color-lighter);">
+                    <template #header>
+                      <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                        <span>多模型对比（共 {{ step3L3Comparisons.length }} 个模型）</span>
+                        <el-radio-group v-model="step3L3CompareViewMode" size="small">
+                          <el-radio-button value="raw">原文</el-radio-button>
+                          <el-radio-button value="preview">看板</el-radio-button>
+                        </el-radio-group>
+                      </div>
+                    </template>
+                    <div class="step2-compare-layout">
+                      <div class="step2-compare-list">
+                        <div
+                          v-for="(item, cmpIdx) in step3L3Comparisons"
+                          :key="`l3-cmp-${cmpIdx}`"
+                          class="step2-compare-card"
+                          :class="{ active: cmpIdx === step3L3ActiveCompareIndex }"
+                          style="cursor: pointer;"
+                          @click="step3L3ActiveCompareIndex = cmpIdx"
+                        >
+                          <div class="step2-compare-title">{{ item.label || item.model_name }}</div>
+                          <el-tag v-if="item.error" type="danger" size="small">调用失败</el-tag>
+                          <el-tag v-else type="success" size="small">{{ (item.draft || '').length }} 字</el-tag>
+                        </div>
+                      </div>
+                      <div class="step2-compare-detail">
+                        <div v-if="step3L3Comparisons[step3L3ActiveCompareIndex]">
+                          <pre v-if="step3L3CompareViewMode === 'raw'" class="result">{{ step3L3Comparisons[step3L3ActiveCompareIndex].draft || (step3L3Comparisons[step3L3ActiveCompareIndex].error ? `调用失败：${step3L3Comparisons[step3L3ActiveCompareIndex].error}` : '空响应') }}</pre>
+                          <MarkdownDashboard v-else :source="step3L3Comparisons[step3L3ActiveCompareIndex].draft || ''" />
+                          <div class="upload-toolbar">
+                            <el-button type="primary" :disabled="!step3L3Comparisons[step3L3ActiveCompareIndex].draft" @click="applyL3Comparison(step3L3ActiveCompareIndex)">导入为当前草案</el-button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </el-card>
+
+                  <!-- 当前三级指标草案 -->
+                  <el-form label-width="110px">
+                    <el-form-item label="三级指标草案">
+                      <div style="width: 100%;">
+                        <div style="display: flex; justify-content: flex-end; margin-bottom: 6px;">
+                          <el-radio-group v-model="step3L3ViewMode" size="small">
+                            <el-radio-button value="edit">编辑</el-radio-button>
+                            <el-radio-button value="preview">看板</el-radio-button>
+                          </el-radio-group>
+                        </div>
+                        <el-input v-if="step3L3ViewMode === 'edit'" v-model="step3L3Draft" type="textarea" :rows="12" placeholder="三级指标草案将显示在这里，支持直接编辑" />
+                        <MarkdownDashboard v-else :source="step3L3Draft || ''" />
+                      </div>
+                    </el-form-item>
+                    <el-form-item label="修改意见">
+                      <el-input v-model="step3L3Feedback" type="textarea" :rows="3" placeholder="输入修改意见，让大模型根据意见重新生成（可选）" />
+                    </el-form-item>
+                  </el-form>
+
+                  <!-- 操作按钮 -->
+                  <div class="upload-toolbar">
+                    <el-button type="primary" :loading="loading" @click="manualSaveCurrentL3">保存当前草案</el-button>
+                    <el-button type="success" :loading="loading" @click="approveL3AndNext">
+                      {{ step3ActiveL2Index + 1 < step3SkeletonTasks.length ? '保存并进入下一个' : '保存并完成全部' }}
+                    </el-button>
+                    <el-button v-if="step3L3Feedback.trim()" type="warning" :loading="loading" @click="step3L3ReviewMode = 'modify'; runStep3Continue()">
+                      提交修改意见重新生成
+                    </el-button>
+                    <el-button @click="chatOpen = true">通过对话修改</el-button>
+                  </div>
+                </div>
+                <div v-else class="step3-l3-tab-preview">
+                  <pre v-if="task.l3_section_markdown" class="result" style="max-height: 300px; overflow: auto;">{{ task.l3_section_markdown }}</pre>
+                  <el-empty v-else description="该二级指标尚未生成三级内容，点击此 Tab 后可操作生成" />
+                </div>
+              </el-tab-pane>
+            </el-tabs>
           </el-card>
 
           <!-- Step3: 完成阶段 -->
@@ -3572,8 +5445,312 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
             </div>
           </el-card>
 
-          <!-- Step6~8, Step10~13: 通用步骤 -->
-          <el-card id="sec-stepN-prev" v-if="stepId >= 6 && stepId <= 8 || stepId >= 10 && stepId <= 13" shadow="never">
+          <!-- Step6: 绩效评价指标体系 + 可选里克特问卷 -->
+          <el-card id="sec-step6-framework" v-if="stepId === 6" shadow="never">
+            <template #header>Step6 · 绩效评价指标体系</template>
+            <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon title="未读取到 Step5 评分标准结果，请确保上一步已完成并保存。" />
+            <el-alert v-else type="info" :closable="false" show-icon class="mb" title="基于 Step3 指标骨架、Step4 分值、Step5 评分标准生成完整指标体系；可选附里克特 5 级满意度问卷。" />
+            <el-form label-width="140px" class="mb">
+              <el-form-item label="是否生成问卷">
+                <el-radio-group v-model="step6QuestionnaireDecision">
+                  <el-radio label="skip">不需要</el-radio>
+                  <el-radio label="need">需要（里克特 5 级）</el-radio>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item v-if="step6QuestionnaireDecision === 'need'" label="问卷修改意见">
+                <el-input v-model="step6QuestionnaireFeedback" type="textarea" :rows="3" placeholder="如需重做问卷，可在此处填入修改意见；首次生成可留空" />
+              </el-form-item>
+            </el-form>
+            <div class="upload-toolbar">
+              <el-button type="primary" :loading="loading" :disabled="!canGenerate" @click="runStep('')">生成指标体系</el-button>
+              <el-button :loading="step6Exporting" :disabled="!step6QuestionnaireDraft && !editor" @click="downloadStep6Markdown">导出指标体系 + 问卷 (.md)</el-button>
+              <el-button :disabled="!step6QuestionnaireDraft && !editor" @click="copyToClipboard(buildStep6CombinedMarkdown())">复制全部 Markdown</el-button>
+            </div>
+
+            <el-divider v-if="step6Tree.length" />
+            <div v-if="step6Tree.length" class="step6-tree-wrap">
+              <div class="step6-tree-head">
+                <div style="font-weight:600;">指标层级可视化（拖拽排序）</div>
+                <div class="step6-tree-tip">支持同级拖拽：L1 之间整组移动；L2 仅同 L1 内重排；L3 仅同 L2 内重排。分值/解释/评分标准随节点同步。</div>
+              </div>
+              <div ref="step6L1ListRef" class="step6-l1-list">
+                <div v-for="(l1, l1Idx) in step6Tree" :key="`l1-${l1Idx}-${l1.name}`" class="step6-l1-row">
+                  <div class="step6-l1-head">
+                    <span class="step6-drag-handle" title="拖动整组">⋮⋮</span>
+                    <span class="step6-l1-name">{{ l1.name }}</span>
+                    <span class="step6-l1-score">{{ Number(l1.score).toFixed(0) }} 分</span>
+                  </div>
+                  <div :ref="(el) => setStep6L2Ref(`l2-${l1Idx}`, el as Element | null)" class="step6-l2-list">
+                    <div v-for="(l2, l2Idx) in l1.level2" :key="`l2-${l1Idx}-${l2Idx}-${l2.name}`" class="step6-l2-row">
+                      <div class="step6-l2-head">
+                        <span class="step6-drag-handle" title="拖动二级指标">⋮⋮</span>
+                        <span class="step6-l2-name">{{ l2.name }}</span>
+                        <span class="step6-l2-score">{{ Number(l2.score).toFixed(0) }} 分</span>
+                      </div>
+                      <div :ref="(el) => setStep6L3Ref(`l3-${l1Idx}-${l2Idx}`, el as Element | null)" class="step6-l3-list">
+                        <div v-for="(l3, l3Idx) in l2.level3" :key="`l3-${l1Idx}-${l2Idx}-${l3.id || l3Idx}`" class="step6-l3-row">
+                          <div class="step6-l3-line1">
+                            <span class="step6-drag-handle" title="拖动三级指标">⋮⋮</span>
+                            <span class="step6-l3-name">{{ l3.name }}</span>
+                            <span class="step6-l3-score">{{ Number(l3.score).toFixed(0) }} 分</span>
+                          </div>
+                          <div v-if="l3.key_points" class="step6-l3-kp">解释：{{ l3.key_points }}</div>
+                          <div v-if="l3.rubric && Object.keys(l3.rubric).length" class="step6-l3-rubric">
+                            评分标准：{{ step6LocalCompressRubric(l3.rubric, Number(l3.score) || 0) }}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <el-divider v-if="step6QuestionnaireItems.length" />
+            <div v-if="step6QuestionnaireItems.length" style="margin-top:12px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                <div style="font-weight:600;">里克特 5 级问卷看板（共 {{ step6QuestionnaireItems.length }} 题）</div>
+                <el-button size="small" @click="copyToClipboard(buildStep6QuestionnaireMarkdown())">复制问卷 Markdown</el-button>
+              </div>
+              <div class="step6-q-board">
+                <el-card v-for="(q, idx) in step6QuestionnaireItems" :key="q.id || idx" shadow="hover" class="step6-q-card">
+                  <div class="step6-q-head">
+                    <span class="step6-q-no">Q{{ String(idx + 1).padStart(2, '0') }}</span>
+                    <span class="step6-q-title">{{ q.question }}</span>
+                  </div>
+                  <div v-if="q.indicator_name" class="step6-q-meta">关联指标：{{ q.indicator_name }}</div>
+                  <div class="step6-q-options">
+                    <el-tag
+                      v-for="opt in q.options"
+                      :key="opt"
+                      size="large"
+                      effect="plain"
+                      class="step6-q-opt"
+                    >{{ opt }}</el-tag>
+                  </div>
+                </el-card>
+              </div>
+
+              <el-divider />
+              <el-collapse>
+                <el-collapse-item title="试填问卷（本地保存，仅供后续 step 聚合参考）" name="fill">
+                  <el-form label-width="100px" class="mb">
+                    <el-form-item label="作答角色">
+                      <el-radio-group v-model="step6RespondentRole">
+                        <el-radio label="村民">村民</el-radio>
+                        <el-radio label="村两委">村两委</el-radio>
+                        <el-radio label="镇政府">镇政府</el-radio>
+                        <el-radio label="其他">其他</el-radio>
+                      </el-radio-group>
+                    </el-form-item>
+                  </el-form>
+                  <el-card v-for="(q, idx) in step6QuestionnaireItems" :key="`fill-${q.id || idx}`" shadow="never" class="step6-q-fill">
+                    <div class="step6-q-head">
+                      <span class="step6-q-no">Q{{ String(idx + 1).padStart(2, '0') }}</span>
+                      <span class="step6-q-title">{{ q.question }}</span>
+                    </div>
+                    <el-radio-group v-model="step6Answers[q.id]" class="step6-q-fill-group">
+                      <el-radio v-for="opt in q.options" :key="opt" :label="opt">{{ opt }}</el-radio>
+                    </el-radio-group>
+                  </el-card>
+                  <div class="upload-toolbar" style="margin-top:12px;">
+                    <el-button type="primary" @click="submitStep6Response">提交本次作答</el-button>
+                    <el-button @click="step6Answers = {}">清空当前作答</el-button>
+                    <el-button v-if="step6ResponseHistory.length" type="danger" plain @click="clearStep6Responses">清空已保存的所有问卷答案</el-button>
+                  </div>
+                  <div v-if="step6ResponseHistory.length" style="margin-top:12px;">
+                    <div style="font-weight:600;margin-bottom:6px;">已保存作答（{{ step6ResponseHistory.length }} 份，仅本浏览器）</div>
+                    <el-table :data="step6ResponseHistory" size="small" border>
+                      <el-table-column prop="respondent_role" label="角色" width="100" />
+                      <el-table-column prop="submitted_at" label="提交时间" width="200">
+                        <template #default="{ row }">{{ new Date(row.submitted_at).toLocaleString() }}</template>
+                      </el-table-column>
+                      <el-table-column label="作答摘要">
+                        <template #default="{ row }">
+                          <span style="color:#666;font-size:12px;">{{ Object.entries(row.answers).map(([k, v]) => `${k}=${v}`).join('；') }}</span>
+                        </template>
+                      </el-table-column>
+                    </el-table>
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
+            </div>
+
+            <el-divider v-if="step6QuestionnaireDraft && !step6QuestionnaireItems.length" />
+            <div v-if="step6QuestionnaireDraft && !step6QuestionnaireItems.length" style="margin-top:12px;">
+              <div style="font-weight:600;margin-bottom:6px;">里克特 5 级问卷草稿</div>
+              <el-input :model-value="step6QuestionnaireDraft" type="textarea" :rows="10" readonly />
+            </div>
+          </el-card>
+
+          <!-- Step 7：指标体系分析与终审成果生成 -->
+          <el-card id="sec-step7-analysis" v-if="stepId === 7" shadow="never">
+            <template #header>
+              <div class="flex items-center justify-between">
+                <div class="font-semibold">Step 7 — 指标体系分析与终审成果生成</div>
+                <div class="text-xs text-gray-500">
+                  评价要点表单化录入 · AI 翻译润色 · 多模型对比 · 级联得分计算
+                </div>
+              </div>
+            </template>
+
+            <div v-if="!step7Form.length" class="step7-empty">
+              <div class="text-gray-500 text-sm" style="margin-bottom:8px;">
+                暂未识别到三级指标。可点击下方按钮立即从 Step 4 / Step 5 / Step 6 的成果回源构造录入表单；
+                若仍为空，请回到对应步骤确认已保存最终版本。
+              </div>
+              <el-button type="primary" :loading="step7Bootstrapping" @click="step7BootstrapForm">
+                立即从上游构造录入表单
+              </el-button>
+            </div>
+
+            <div v-else class="step7-wrap">
+              <!-- 顶部：问卷统计 -->
+              <div class="step7-survey-bar">
+                <div class="step7-survey-title">现场问卷与样本数据（驱动效益环节 AI 撰写）</div>
+                <div class="step7-survey-row">
+                  <el-input-number v-model="step7SurveySample" :min="0" :step="1" placeholder="有效样本量"
+                    controls-position="right" style="width: 160px;" />
+                  <el-input-number v-model="step7SurveyRate" :min="0" :max="1" :step="0.01" :precision="2"
+                    placeholder="综合满意率(0~1)" controls-position="right" style="width: 200px;" />
+                  <el-input v-model="step7SurveySummary" placeholder="补充说明（如：覆盖 3 村 35 户，满意率 88%）"
+                    style="flex:1; min-width: 280px;" clearable />
+                </div>
+              </div>
+
+              <el-divider content-position="left">逐要点表单（按指标拆分）</el-divider>
+
+              <div class="step7-form-list">
+                <div v-for="form in step7Form" :key="form.id" class="step7-form-card">
+                  <div class="step7-form-head">
+                    <div class="step7-form-title">
+                      <el-tag size="small">{{ form.l1_name }}</el-tag>
+                      <el-tag size="small" type="info">{{ form.l2_name }}</el-tag>
+                      <span class="step7-form-l3">{{ form.l3_name }}</span>
+                    </div>
+                    <div class="step7-form-meta">
+                      满分 <b>{{ Number(form.score).toFixed(2) }}</b> ｜
+                      已填得分
+                      <b :class="{ 'text-red-600': step7TotalUserSum(form) > Number(form.score) }">
+                        {{ step7TotalUserSum(form).toFixed(2) }}
+                      </b>
+                    </div>
+                  </div>
+
+                  <div v-for="pt in step7Inputs[form.id] || []" :key="pt.key" class="step7-point-row">
+                    <div class="step7-point-head">
+                      <span class="step7-point-key">{{ pt.key }}</span>
+                      <span class="step7-point-label">{{ pt.label }}</span>
+                    </div>
+                    <el-input v-model="pt.plain_text" type="textarea" :rows="2"
+                      placeholder="大白话事实：现场看到了什么、查了什么台账、收到了什么反馈" />
+                    <div class="step7-point-row2">
+                      <el-input-number v-model="pt.score" :min="0" :max="Number(form.score)" :step="0.5" :precision="2"
+                        controls-position="right" style="width: 140px;"
+                        @change="step7ClampPoint(form, pt)" />
+                      <el-input v-model="pt.deduction_reason"
+                        placeholder="得分/扣分原因（如：台账缺一项 → 扣 2 分）" style="flex:1;" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 操作区 -->
+              <el-divider />
+              <div class="step7-actions">
+                <el-button type="primary" :loading="step7Generating" @click="generateStep7Analysis">
+                  AI 翻译并生成专家分析
+                </el-button>
+                <el-input v-model="step7ReviewFeedback" placeholder="软磨：例如『把扣分语气改得更委婉』"
+                  style="flex:1; min-width: 260px;" />
+                <el-button :loading="step7Reviewing" :disabled="!step7AnalysisRows.length"
+                  @click="reviewStep7Analysis">软磨润色</el-button>
+              </div>
+
+              <!-- 多模型对比 -->
+              <div v-if="step7Comparisons.length > 1" class="step7-compare">
+                <div class="step7-compare-title">多模型同台对比（可一键采用）</div>
+                <div class="step7-compare-list">
+                  <div v-for="(c, idx) in step7Comparisons" :key="idx" class="step7-compare-card">
+                    <div class="step7-compare-head">
+                      <b>{{ c.label || c.model_name }}</b>
+                      <el-button size="small" :disabled="!c.draft || !!c.error" @click="step7AdoptComparison(c)">
+                        采用此模型
+                      </el-button>
+                    </div>
+                    <pre v-if="!c.error" class="step7-compare-body">{{ c.draft }}</pre>
+                    <div v-else class="step7-compare-error">⚠ {{ c.error }}</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 结果总览 -->
+              <div v-if="step7AnalysisRows.length" class="step7-summary">
+                <el-divider content-position="left">级联得分汇总</el-divider>
+                <div class="step7-stat-row">
+                  <div class="step7-stat-card"><div class="step7-stat-label">项目得分</div>
+                    <div class="step7-stat-value">{{ step7TotalScore.toFixed(2) }}</div></div>
+                  <div class="step7-stat-card"><div class="step7-stat-label">满分</div>
+                    <div class="step7-stat-value">{{ step7TotalFull.toFixed(2) }}</div></div>
+                  <div class="step7-stat-card"><div class="step7-stat-label">总得分率</div>
+                    <div class="step7-stat-value">{{ (step7OverallRate * 100).toFixed(2) }}%</div></div>
+                </div>
+
+                <el-divider content-position="left">AI 事实级深度分析（逐三级指标）</el-divider>
+                <el-collapse>
+                  <el-collapse-item v-for="row in step7AnalysisRows" :key="row.id"
+                    :name="row.id">
+                    <template #title>
+                      <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+                        <el-tag size="small">{{ row.l1_name }}</el-tag>
+                        <el-tag size="small" type="info">{{ row.l2_name }}</el-tag>
+                        <span style="font-weight:600;">{{ row.l3_name }}</span>
+                        <el-tag size="small" :type="row.score_rate >= 0.9 ? 'success' : row.score_rate >= 0.6 ? 'warning' : 'danger'">
+                          {{ Number(row.obtained_score).toFixed(2) }} / {{ Number(row.score).toFixed(2) }}（{{ (Number(row.score_rate) * 100).toFixed(1) }}%）
+                        </el-tag>
+                      </div>
+                    </template>
+                    <div v-if="row.deduction_reason" style="margin-bottom:6px;color:#b54708;">
+                      扣分原因：{{ row.deduction_reason }}
+                    </div>
+                    <div style="white-space:pre-wrap;line-height:1.7;color:#1f2937;">{{ row.analysis }}</div>
+                    <div v-if="row.model_name" style="margin-top:6px;font-size:12px;color:#6b7280;">
+                      采用模型：{{ row.model_name }}
+                    </div>
+                  </el-collapse-item>
+                </el-collapse>
+
+                <el-divider content-position="left">分块分析（决策 / 过程 / 产出 / 效益）</el-divider>
+                <div class="step7-md-preview" v-html="renderMarkdown(step7BlockMd || '')"></div>
+                <el-divider content-position="left">总评分表（一级 / 二级 / 三级 / 分值 / 得分 / 扣分原因）</el-divider>
+                <div class="step7-md-preview" v-html="renderMarkdown(step7OverallMd || '')"></div>
+
+                <el-divider content-position="left">终审定稿成果（指标体系分析与得分表 · 完整版）</el-divider>
+                <div class="step7-md-preview" v-html="renderMarkdown(step7FinalMd || '')"></div>
+              </div>
+
+              <!-- 导出参数 -->
+              <el-divider content-position="left">导出参数（一键导出 Word / PDF）</el-divider>
+              <div class="step7-export-bar">
+                <el-select v-model="step7ExportFontFamily" style="width: 200px;">
+                  <el-option label="仿宋_GB2312" value="FangSong_GB2312" />
+                  <el-option label="宋体（SimSun）" value="SimSun" />
+                  <el-option label="黑体" value="SimHei" />
+                  <el-option label="楷体" value="KaiTi" />
+                </el-select>
+                <el-input-number v-model="step7ExportFontSize" :min="9" :max="22" :step="1"
+                  controls-position="right" style="width: 140px;" />
+                <el-input-number v-model="step7ExportLineHeight" :min="1.0" :max="2.5" :step="0.1" :precision="1"
+                  controls-position="right" style="width: 140px;" />
+                <el-button type="success" :disabled="!step7AnalysisRows.length" @click="exportStep7Document">
+                  一键导出指标体系得分表
+                </el-button>
+              </div>
+            </div>
+          </el-card>
+
+          <!-- Step8, Step10~13: 通用步骤（Step7 单独走专属表单卡片，不走这里） -->
+          <el-card id="sec-stepN-prev" v-if="stepId === 8 || stepId >= 10 && stepId <= 13" shadow="never">
             <template #header>{{ titleMap[stepId] ?? `Step${stepId}` }}</template>
             <el-alert v-if="!prevStepContent && !editor" type="warning" :closable="false" show-icon :title="`未读取到 Step${stepId - 1} 结果，请确保上一步已完成并保存。`" />
             <el-alert v-else type="info" :closable="false" show-icon class="mb" :title="`基于 Step${stepId - 1} 输出内容继续生成。`" />
@@ -4142,5 +6319,74 @@ watch(() => workflowBus.pendingCommand, (cmd) => {
 .gap-channel-label { font-size: 12px; color: var(--el-text-color-secondary); }
 .gap-channel-alert { margin-top: 4px; }
 .gap-channel-action { width: 100%; }
+.step6-q-board { display: flex; flex-direction: column; gap: 12px; }
+.step6-q-card { border-left: 3px solid var(--el-color-primary); }
+.step6-q-fill { border: 1px dashed var(--el-border-color); margin-bottom: 8px; }
+.step6-q-head { display: flex; align-items: baseline; gap: 8px; }
+.step6-q-no { font-weight: 600; color: var(--el-color-primary); min-width: 44px; }
+.step6-q-title { font-weight: 500; line-height: 1.5; }
+.step6-q-meta { color: var(--el-text-color-secondary); font-size: 12px; margin: 6px 0 8px 52px; }
+.step6-q-options { display: flex; flex-wrap: wrap; gap: 8px; margin-left: 52px; }
+.step6-q-opt { font-size: 13px; }
+.step6-q-fill-group { display: flex; flex-wrap: wrap; gap: 12px; margin-left: 52px; margin-top: 6px; }
+.step6-tree-wrap { background: var(--el-fill-color-lighter); padding: 12px; border-radius: 8px; }
+.step6-tree-head { margin-bottom: 10px; }
+.step6-tree-tip { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 4px; }
+.step6-l1-list { display: flex; flex-direction: column; gap: 10px; }
+.step6-l1-row { background: var(--el-bg-color); border: 1px solid var(--el-border-color); border-radius: 6px; padding: 10px; }
+.step6-l1-head { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--el-color-primary); padding-bottom: 8px; border-bottom: 1px dashed var(--el-border-color-lighter); }
+.step6-l1-name { flex: 1; }
+.step6-l1-score { font-weight: 700; color: var(--el-color-warning); }
+.step6-l2-list { display: flex; flex-direction: column; gap: 8px; padding: 8px 0 0 18px; }
+.step6-l2-row { background: var(--el-fill-color-light); border: 1px solid var(--el-border-color-lighter); border-radius: 5px; padding: 8px; }
+.step6-l2-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.step6-l2-name { flex: 1; }
+.step6-l2-score { color: var(--el-color-warning); }
+.step6-l3-list { display: flex; flex-direction: column; gap: 6px; padding: 6px 0 0 18px; }
+.step6-l3-row { display: flex; flex-direction: column; gap: 4px; background: var(--el-bg-color); border: 1px dashed var(--el-border-color-lighter); border-radius: 4px; padding: 8px 10px; font-size: 13px; }
+.step6-l3-line1 { display: flex; align-items: center; gap: 8px; }
+.step6-l3-name { flex: 1; font-weight: 500; }
+.step6-l3-score { color: var(--el-color-warning); min-width: 50px; text-align: right; font-weight: 600; }
+.step6-l3-kp { color: var(--el-text-color-regular); font-size: 12px; padding-left: 22px; line-height: 1.5; }
+.step6-l3-rubric { color: var(--el-text-color-secondary); font-size: 12px; padding-left: 22px; line-height: 1.5; }
+.step6-drag-handle { cursor: grab; color: var(--el-text-color-placeholder); user-select: none; padding: 0 4px; font-size: 14px; }
+.step6-drag-handle:active { cursor: grabbing; }
+
+/* === Step 7：指标体系分析与终审成果生成 === */
+.step7-wrap { display: flex; flex-direction: column; gap: 14px; }
+.step7-empty { display: flex; flex-direction: column; gap: 8px; padding: 8px 0; }
+.step7-survey-bar { background: var(--el-fill-color-light); border: 1px solid var(--el-border-color-lighter); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.step7-survey-title { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); }
+.step7-survey-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.step7-form-list { display: flex; flex-direction: column; gap: 12px; }
+.step7-form-card { border: 1px solid var(--el-border-color); border-radius: 8px; padding: 12px 14px; background: var(--el-bg-color); }
+.step7-form-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding-bottom: 8px; border-bottom: 1px dashed var(--el-border-color-lighter); margin-bottom: 10px; }
+.step7-form-title { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.step7-form-l3 { font-weight: 600; font-size: 14px; color: var(--el-text-color-primary); }
+.step7-form-meta { font-size: 12px; color: var(--el-text-color-regular); }
+.step7-point-row { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-left: 3px solid var(--el-color-primary-light-5); background: var(--el-fill-color-blank); margin-bottom: 8px; border-radius: 0 4px 4px 0; }
+.step7-point-head { display: flex; gap: 6px; align-items: center; }
+.step7-point-key { display: inline-block; min-width: 26px; padding: 0 6px; height: 20px; line-height: 20px; text-align: center; font-size: 12px; font-weight: 600; color: var(--el-color-primary); background: var(--el-color-primary-light-9); border-radius: 3px; }
+.step7-point-label { font-size: 13px; color: var(--el-text-color-primary); flex: 1; }
+.step7-point-row2 { display: flex; gap: 8px; align-items: center; }
+.step7-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.step7-compare { border: 1px solid var(--el-border-color-light); border-radius: 6px; padding: 10px 12px; background: var(--el-fill-color-lighter); }
+.step7-compare-title { font-weight: 600; font-size: 13px; margin-bottom: 8px; color: var(--el-text-color-primary); }
+.step7-compare-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+.step7-compare-card { border: 1px solid var(--el-border-color-lighter); border-radius: 4px; background: var(--el-bg-color); padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.step7-compare-head { display: flex; justify-content: space-between; align-items: center; }
+.step7-compare-body { max-height: 220px; overflow: auto; font-size: 12px; line-height: 1.5; padding: 6px 8px; background: var(--el-fill-color-light); border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+.step7-compare-error { color: var(--el-color-danger); font-size: 12px; }
+.step7-summary { display: flex; flex-direction: column; gap: 8px; }
+.step7-stat-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.step7-stat-card { flex: 1; min-width: 140px; border: 1px solid var(--el-border-color-light); border-radius: 6px; padding: 10px 14px; text-align: center; background: var(--el-fill-color-lighter); }
+.step7-stat-label { font-size: 12px; color: var(--el-text-color-secondary); margin-bottom: 4px; }
+.step7-stat-value { font-size: 22px; font-weight: 700; color: var(--el-color-primary); }
+.step7-md-preview { border: 1px solid var(--el-border-color-lighter); border-radius: 4px; padding: 10px 12px; max-height: 460px; overflow: auto; background: var(--el-bg-color); font-size: 13px; line-height: 1.65; }
+.step7-md-preview :deep(table) { border-collapse: collapse; width: 100%; margin: 8px 0; }
+.step7-md-preview :deep(th), .step7-md-preview :deep(td) { border: 1px solid var(--el-border-color); padding: 6px 8px; vertical-align: top; }
+.step7-md-preview :deep(th) { background: var(--el-fill-color-light); font-weight: 600; }
+.step7-export-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
 @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } .upload-matrix { grid-template-columns: 1fr; } .step3-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .gap-channel-grid { grid-template-columns: 1fr; } }
 </style>
